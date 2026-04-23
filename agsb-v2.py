@@ -669,8 +669,8 @@ def create_sing_box_config(port_vm_ws, uuid_str):
         "log": {"level": "info", "timestamp": True},
         "inbounds": [{
             "type": "vmess", "tag": "vmess-in", "listen": "127.0.0.1",
-            "listen_port": port_vm_ws, "tcp_fast_open": True, "sniff": True,
-            "sniff_override_destination": True, "proxy_protocol": False, # No proxy protocol from local cloudflared
+            "listen_port": port_vm_ws, "tcp_fast_open": True, 
+            "proxy_protocol": False, # No proxy protocol from local cloudflared
             "users": [{"uuid": uuid_str, "alterId": 0}], # alterId 0 is common now
             "transport": {
                 "type": "ws", "path": ws_path,
