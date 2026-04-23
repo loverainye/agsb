@@ -677,15 +677,6 @@ def create_sing_box_config(port_vm_ws, uuid_str):
                 "max_early_data": 2048, "early_data_header_name": "Sec-WebSocket-Protocol"
             }
         }],
-        "route": {
-            "rules": [
-              {
-                "inbound": ["vmess-in"],
-                "action": "sniff",    
-                "sniff_override_destination": true  
-              }
-            ]
-        },
         "outbounds": [{"type": "direct", "tag": "direct"}]
     }
     sb_config_file = INSTALL_DIR / "sb.json"
