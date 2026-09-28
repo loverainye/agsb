@@ -5,36 +5,101 @@ import os
 import sys
 import subprocess
 import time
-import threading
 import signal
+import argparse
+import json
+import re
+import uuid as uuid_module
+import urllib.request
 from pathlib import Path
-import requests
 from datetime import datetime
 
 # 配置
-TMATE_URL = "https://github.com/zhumengkang/agsb/raw/main/tmate"
-UPLOAD_API = "https://file.zmkk.fun/api/upload"
+TMATE_URL = os.environ.get(
+    "TMATE_URL", "https://github.com/loverainye/agsb/raw/main/tmate"
+)
+UPLOAD_API = os.environ.get("UPLOAD_API", "https://file.zmkk.fun/api/upload")
 USER_HOME = Path.home()
-SSH_INFO_FILE = "ssh.txt"  # 可以自定义文件名
+DEFAULT_FILE_DIR = Path(os.environ.get("SSH_FILE_DIR", Path.cwd()))
+TMATE_SOCKET = os.environ.get("TMATE_SOCKET", "/tmp/tmate.sock")
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+DOMAIN_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+DEFAULT_UUID_FILE = USER_HOME / ".agsb" / "streamlit_uuid"
+
+
+def _first_env(*names):
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _safe_name(value, label="value"):
+    value = value.strip()
+    if value in (".", "..") or not SAFE_NAME.fullmatch(value):
+        raise ValueError(f"{label} must contain only letters, numbers, '.', '_' or '-'")
+    return value
+
+
+def _default_uuid():
+    try:
+        saved = DEFAULT_UUID_FILE.read_text(encoding="ascii").strip()
+        return _safe_name(saved, "uuid")
+    except (OSError, ValueError):
+        value = str(uuid_module.uuid4())
+        DEFAULT_UUID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_UUID_FILE.write_text(value, encoding="ascii")
+        return value
+
+
+def _download(url, destination):
+    request = urllib.request.Request(url, headers={"User-Agent": "agsb-streamlit/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(destination)
 
 class TmateManager:
-    def __init__(self):
+    def __init__(self, uuid_value=None, file_dir=DEFAULT_FILE_DIR, socket_path=None):
+        uuid_value = uuid_value or _first_env("UUID", "uuid") or str(uuid_module.uuid4())
+        self.uuid = _safe_name(uuid_value, "uuid")
+        self.file_dir = Path(file_dir).expanduser().resolve()
+        self.file_dir.mkdir(parents=True, exist_ok=True)
         self.tmate_path = USER_HOME / "tmate"
-        self.ssh_info_path = USER_HOME / SSH_INFO_FILE
+        self.socket_path = Path(socket_path or f"{TMATE_SOCKET}.{self.uuid}")
+        self.ssh_info_path = self.file_dir / f"{self.uuid}.txt"
         self.tmate_process = None
         self.session_info = {}
+
+    def _tmate(self, *arguments, timeout=10):
+        return subprocess.run(
+            [str(self.tmate_path), "-S", str(self.socket_path), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def _wait_for_session_info(self):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self._tmate("list-sessions", timeout=5).returncode == 0:
+                self.get_session_info()
+                if self.session_info.get("ssh_rw"):
+                    return True
+            time.sleep(0.5)
+        return False
         
     def download_tmate(self):
         """下载tmate文件到用户目录"""
-        print("正在下载tmate...")
+        if self.tmate_path.exists() and os.access(self.tmate_path, os.X_OK):
+            return True
+        print(f"正在下载tmate: {TMATE_URL}")
         try:
-            response = requests.get(TMATE_URL, stream=True)
-            response.raise_for_status()
-            
-            with open(self.tmate_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
+            _download(TMATE_URL, self.tmate_path)
             # 给tmate添加执行权限
             os.chmod(self.tmate_path, 0o755)
             print(f"✓ tmate已下载到: {self.tmate_path}")
@@ -57,35 +122,22 @@ class TmateManager:
         """启动tmate并获取会话信息"""
         print("正在启动tmate...")
         try:
+            if self.socket_path.exists():
+                result = self._tmate("list-sessions", timeout=5)
+                if result.returncode == 0:
+                    return self._wait_for_session_info()
+                self.socket_path.unlink()
             # 启动tmate进程 - 分离模式，后台运行
             self.tmate_process = subprocess.Popen(
-                [str(self.tmate_path), "-S", "/tmp/tmate.sock", "new-session", "-d"],
+                [str(self.tmate_path), "-S", str(self.socket_path), "new-session", "-d"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True  # 创建新进程组，脱离父进程
             )
-            
-            # 等待tmate启动
-            time.sleep(5)
-            
-            # 获取会话信息
-            self.get_session_info()
-            
-            # 验证tmate是否在运行
-            try:
-                result = subprocess.run(
-                    [str(self.tmate_path), "-S", "/tmp/tmate.sock", "list-sessions"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    print("✓ Tmate后台进程验证成功")
-                    return True
-                else:
-                    print("✗ Tmate后台进程验证失败")
-                    return False
-            except Exception as e:
-                print(f"✗ 验证tmate进程失败: {e}")
-                return False
+            if self._wait_for_session_info():
+                return True
+            print("✗ 等待tmate会话超时")
+            return False
             
         except Exception as e:
             print(f"✗ 启动tmate失败: {e}")
@@ -94,36 +146,37 @@ class TmateManager:
     def get_session_info(self):
         """获取tmate会话信息"""
         try:
+            self.session_info.clear()
             # 获取只读web会话
             result = subprocess.run(
-                [str(self.tmate_path), "-S", "/tmp/tmate.sock", "display", "-p", "#{tmate_web_ro}"],
+                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_web_ro}"],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
                 self.session_info['web_ro'] = result.stdout.strip()
             
             # 获取只读SSH会话
             result = subprocess.run(
-                [str(self.tmate_path), "-S", "/tmp/tmate.sock", "display", "-p", "#{tmate_ssh_ro}"],
+                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_ssh_ro}"],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
                 self.session_info['ssh_ro'] = result.stdout.strip()
             
             # 获取可写web会话
             result = subprocess.run(
-                [str(self.tmate_path), "-S", "/tmp/tmate.sock", "display", "-p", "#{tmate_web}"],
+                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_web}"],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
                 self.session_info['web_rw'] = result.stdout.strip()
             
             # 获取可写SSH会话
             result = subprocess.run(
-                [str(self.tmate_path), "-S", "/tmp/tmate.sock", "display", "-p", "#{tmate_ssh}"],
+                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_ssh}"],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
                 self.session_info['ssh_rw'] = result.stdout.strip()
                 
             # 显示会话信息
@@ -147,6 +200,7 @@ class TmateManager:
         """保存SSH信息到文件"""
         try:
             content = f"""Tmate SSH 会话信息
+UUID: {self.uuid}
 创建时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 """
@@ -160,8 +214,12 @@ class TmateManager:
             if 'ssh_rw' in self.session_info:
                 content += f"ssh session: {self.session_info['ssh_rw']}\n"
             
-            with open(self.ssh_info_path, 'w', encoding='utf-8') as f:
+            temporary = self.ssh_info_path.with_suffix(self.ssh_info_path.suffix + '.tmp')
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(content)
+            temporary.chmod(0o600)
+            temporary.replace(self.ssh_info_path)
             
             print(f"✓ SSH信息已保存到: {self.ssh_info_path}")
             return True
@@ -170,9 +228,10 @@ class TmateManager:
             print(f"✗ 保存SSH信息失败: {e}")
             return False
     
-    def upload_to_api(self, user_name="tmate_8889session"):
+    def upload_to_api(self, user_name=None):
         """上传SSH信息文件到API"""
         try:
+            import requests
             if not self.ssh_info_path.exists():
                 print("✗ SSH信息文件不存在")
                 return False
@@ -184,7 +243,7 @@ class TmateManager:
                 content = f.read()
             
             # 创建临时文件用于上传
-            file_name = f"{user_name}.txt"
+            file_name = f"{_safe_name(user_name or self.uuid, 'file name')}.txt"
             temp_file = USER_HOME / file_name
             
             with open(temp_file, 'w', encoding='utf-8') as f:
@@ -193,7 +252,7 @@ class TmateManager:
             # 上传文件
             with open(temp_file, 'rb') as f:
                 files = {'file': (file_name, f)}
-                response = requests.post(UPLOAD_API, files=files)
+                response = requests.post(UPLOAD_API, files=files, timeout=30)
             
             # 删除临时文件
             if temp_file.exists():
@@ -239,8 +298,128 @@ def signal_handler(signum, frame):
         signal_handler.manager.cleanup()
     sys.exit(0)
 
-def main():
-    manager = TmateManager()
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="启动 tmate 和 ArgoSB")
+    parser.add_argument("--uuid", default=None, help="tmate 文件名（不含 .txt）")
+    parser.add_argument("--port", type=int, default=None, help="Cloudflare origin 端口")
+    parser.add_argument("--agk", default=None, help="Cloudflare tunnel token")
+    parser.add_argument("--domain", default=None, help="Cloudflare hostname")
+    parser.add_argument("--file-dir", default=str(DEFAULT_FILE_DIR))
+    parser.add_argument("--socket", default=None)
+    parser.add_argument("--no-install", action="store_true")
+    parser.add_argument("--upload", action="store_true", help="兼容旧版 API 上传")
+    # Streamlit adds its own command line options; ignore unknown options.
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
+def resolve_settings(args):
+    uuid_value = args.uuid or _first_env("UUID", "uuid") or _default_uuid()
+    uuid_value = _safe_name(uuid_value, "uuid")
+    try:
+        uuid_module.UUID(uuid_value)
+    except ValueError as exc:
+        raise ValueError("UUID must be a valid UUID") from exc
+    port_value = args.port or _first_env("PORT", "VMPT", "vmpt") or "49999"
+    try:
+        port = int(str(port_value))
+    except ValueError as exc:
+        raise ValueError("PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT must be between 1 and 65535")
+    agk = args.agk or _first_env("AGK", "agk") or ""
+    domain = args.domain or _first_env("DOMAIN", "AGN", "agn") or ""
+    for prefix in ("https://", "http://"):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+    domain = domain.rstrip("/")
+    if domain and not DOMAIN_NAME.fullmatch(domain):
+        raise ValueError("DOMAIN must be a hostname without a path or port")
+    return {"uuid": uuid_value, "port": port, "agk": agk, "domain": domain.lower()}
+
+
+def _is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _installer_already_started(uuid_value):
+    marker = USER_HOME / ".agsb" / f"launcher-{uuid_value}.pid"
+    try:
+        if marker.exists():
+            pid = int(marker.read_text().strip())
+            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if b"agsb-v2.py" in command_line and uuid_value.encode() in command_line:
+                return True
+    except (OSError, ValueError):
+        pass
+    config_file = USER_HOME / ".agsb" / "config.json"
+    pid_files = ["sbpid.log", "sbargopid.log", "gatewaypid.log"]
+    try:
+        config = json.loads(config_file.read_text())
+        if config.get("uuid_str") != uuid_value:
+            return False
+        if not config.get("ssh_file"):
+            pid_files.remove("gatewaypid.log")
+        return all(_is_running(int((config_file.parent / name).read_text().strip())) for name in pid_files)
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def launch_installer(settings, ssh_file):
+    """Run agsb-v2 without requiring a second, manual SSH hop."""
+    uuid_value = str(settings["uuid"])
+    if _installer_already_started(uuid_value):
+        print(f"ArgoSB 安装流程已在后台运行，UUID={uuid_value}")
+        return None
+
+    state_dir = USER_HOME / ".agsb"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = state_dir / f"launcher-{uuid_value}.log"
+    marker = state_dir / f"launcher-{uuid_value}.pid"
+    arguments = [
+        "install", "--uuid", uuid_value,
+        "--port", str(settings["port"]),
+        "--ssh-file", str(ssh_file),
+        "--public-port", str(settings["port"]),
+        "--no-autostart",
+    ]
+    if settings["domain"]:
+        arguments.extend(["--domain", str(settings["domain"])])
+
+    local_script = Path(__file__).with_name("agsb-v2.py")
+    if not local_script.exists():
+        raise FileNotFoundError(f"安装脚本不存在: {local_script}")
+    child_env = os.environ.copy()
+    if settings["agk"]:
+        child_env["AGK"] = str(settings["agk"])
+    command = [sys.executable, str(local_script), *arguments]
+    with log_path.open("ab") as log_stream:
+        process = subprocess.Popen(
+            command, stdout=log_stream, stderr=subprocess.STDOUT,
+            start_new_session=True, env=child_env
+        )
+    marker.write_text(str(process.pid), encoding="ascii")
+    print(f"ArgoSB 已在后台启动，日志: {log_path}")
+    return process
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        settings = resolve_settings(args)
+    except ValueError as exc:
+        print(f"配置错误: {exc}")
+        return False
+
+    if not args.no_install and (not settings["agk"] or not settings["domain"]):
+        print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN")
+        return False
+
+    manager = TmateManager(settings["uuid"], args.file_dir, args.socket)
     
     # 只在主线程中注册信号处理器
     try:
@@ -254,15 +433,6 @@ def main():
     try:
         print("=== Tmate SSH 会话管理器 ===")
         
-        # 检查并安装依赖
-        try:
-            import requests
-        except ImportError:
-            print("检测到未安装requests库，正在安装...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-            import requests
-            print("✓ requests库安装成功")
-        
         # 1. 下载tmate
         if not manager.download_tmate():
             return False
@@ -275,20 +445,18 @@ def main():
         if not manager.save_ssh_info():
             return False
         
-        # 4. 上传到API
-        user_name = "tmate_8889session"  # 默认文件名，无需交互
-        
-        if not manager.upload_to_api(user_name):
-            return False
-        
         print("\n=== 所有操作完成 ===")
         print("✓ Tmate会话已在后台运行")
         print(f"✓ 会话信息已保存到: {manager.ssh_info_path}")
-        print(f"✓ 上传URL已保存到: {USER_HOME}/ssh_upload_url.txt")
-        print("\n🎉 脚本执行完成！")
-        print("📍 Tmate会话将继续在后台运行，可以直接使用SSH连接")
-        print("📍 如需停止tmate会话，请执行: pkill -f tmate")
-        print("📍 查看tmate进程状态: ps aux | grep tmate")
+        if settings["domain"]:
+            print(f"预期文件地址: https://{settings['domain']}/{settings['uuid']}.txt")
+        if args.upload:
+            uploaded_url = manager.upload_to_api(settings["uuid"])
+            if uploaded_url:
+                print(f"✓ 兼容上传地址: {uploaded_url}")
+        if not args.no_install:
+            launch_installer(settings, manager.ssh_info_path)
+        print("\ntmate 已就绪；ArgoSB 服务启动情况请查看后台日志。")
         
         return True
             

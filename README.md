@@ -22,6 +22,8 @@
   - [📁 文件结构](#-文件结构)
   - [✅ 优势特点](#-优势特点)
 
+- [Streamlit tmate 自动启动](#streamlit-tmate-自动启动)
+
 - [🌐 Glitch 网站保活脚本](#-glitch-网站保活脚本)
   - [🔥 主要功能](#-主要功能)
   - [💾 安装与使用](#-安装与使用)
@@ -435,6 +437,25 @@ cd ~ && curl -fsSL https://raw.githubusercontent.com/zhumengkang/agsb/main/agsb-
 - ⚠️ 请确保`~/bin`目录在PATH环境变量中
 
 ---
+
+## Streamlit tmate 自动启动
+
+`upload-yuancheng.py` 是 `.devcontainer` 中的 Streamlit 入口。启动时它会创建一个后台 tmate 会话，把连接信息写入 `<UUID>.txt`，并自动启动 `agsb-v2.py`。当配置了 `DOMAIN` 时，文件地址为 `https://DOMAIN/UUID.txt`。
+
+通过环境变量配置启动参数：
+
+```bash
+export UUID="your-uuid"
+export PORT=49999
+export AGK="your-cloudflare-tunnel-token"
+export DOMAIN="your.domain.example"
+```
+
+Cloudflare 隧道使用 `AGK` 启动。启用 UUID 文件时，`PORT` 是唯一的 Cloudflare origin 端口；网关在该端口返回 `<UUID>.txt`，其他 WebSocket 请求转发到 sing-box 的内部端口。
+
+在 Cloudflare Zero Trust 的该命名隧道中，需将 `DOMAIN` 的 Public Hostname 服务地址设为 `http://localhost:PORT`（将 `PORT` 替换为实际值）。隧道 token 仅用于连接已有隧道，不能自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。
+
+`UUID.txt` 含可写 tmate SSH 会话地址，知道该 URL 的人可以连接会话；需要限制访问时可在 Cloudflare 为该路径配置 Access 策略。
 
 ## 🌐 Glitch 网站保活脚本
 

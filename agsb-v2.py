@@ -19,12 +19,17 @@ import urllib.request
 import ssl
 import tempfile
 import argparse
+import shlex
+import textwrap
 
 # 全局变量
 INSTALL_DIR = Path.home() / ".agsb"  # 用户主目录下的隐藏文件夹，避免root权限
 CONFIG_FILE = INSTALL_DIR / "config.json"
 SB_PID_FILE = INSTALL_DIR / "sbpid.log"
 ARGO_PID_FILE = INSTALL_DIR / "sbargopid.log"
+GATEWAY_PID_FILE = INSTALL_DIR / "gatewaypid.log"
+GATEWAY_SCRIPT_FILE = INSTALL_DIR / "gateway.py"
+TUNNEL_TOKEN_FILE = INSTALL_DIR / "tunnel_token"
 LIST_FILE = INSTALL_DIR / "list.txt"
 LOG_FILE = INSTALL_DIR / "argo.log"
 DEBUG_LOG = INSTALL_DIR / "python_debug.log"
@@ -40,6 +45,9 @@ def parse_args():
     parser.add_argument("--uuid", "-u", help="设置自定义UUID")
     parser.add_argument("--port", "-p", dest="vmpt", type=int, help="设置自定义Vmess端口")
     parser.add_argument("--agk", "--token", dest="agk", help="设置 Argo Tunnel Token (用于Cloudflare Zero Trust命名隧道)")
+    parser.add_argument("--ssh-file", dest="ssh_file", help="通过同一隧道公开的 UUID tmate 文件")
+    parser.add_argument("--public-port", dest="public_port", type=int, help="Cloudflare origin/gateway 端口")
+    parser.add_argument("--no-autostart", action="store_true", help="跳过 crontab 自启动配置")
 
     return parser.parse_args()
 
@@ -132,6 +140,22 @@ def download_binary(name, download_url, target_path):
     else:
         print(f"{name} 下载失败!")
         return False
+
+
+def choose_gateway_upstream_port(public_port):
+    """Choose an internal sing-box port when the public port hosts the gateway."""
+    candidates = list(range(public_port + 1, min(public_port + 101, 65536)))
+    candidates.extend(range(10000, min(public_port, 10100)))
+    for candidate in candidates:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", candidate))
+            return candidate
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    raise RuntimeError("无法为 sing-box 找到内部端口")
 
 # 生成VMess链接
 def generate_vmess_link(config):
@@ -309,7 +333,7 @@ def install(args):
 
     # --- 获取配置值 ---
     # UUID
-    uuid_str = args.uuid or os.environ.get("uuid")
+    uuid_str = args.uuid or os.environ.get("UUID") or os.environ.get("uuid")
     if not uuid_str:
         uuid_input = input("请输入自定义UUID (例如: 25bd7521-eed2-45a1-a50a-97e432552aca, 留空则随机生成): ").strip()
         uuid_str = uuid_input or str(uuid.uuid4())
@@ -317,14 +341,14 @@ def install(args):
     write_debug_log(f"UUID: {uuid_str}")
 
     # Vmess Port (vmpt)
-    port_vm_ws_str = str(args.vmpt) if args.vmpt else os.environ.get("vmpt")
+    port_vm_ws_str = str(args.vmpt) if args.vmpt else (os.environ.get("PORT") or os.environ.get("vmpt"))
     if not port_vm_ws_str:
         port_vm_ws_str = input(f"请输入自定义Vmess端口 (例如: 49999, 10000-65535, 留空则随机生成): ").strip()
     
     if port_vm_ws_str:
         try:
             port_vm_ws = int(port_vm_ws_str)
-            if not (10000 <= port_vm_ws <= 65535):
+            if not (1 <= port_vm_ws <= 65535):
                 print("端口号无效，将使用随机端口。")
                 port_vm_ws = random.randint(10000, 65535)
         except ValueError:
@@ -336,7 +360,7 @@ def install(args):
     write_debug_log(f"Vmess Port: {port_vm_ws}")
 
     # Argo Tunnel Token (agk)
-    argo_token = args.agk or os.environ.get("agk")
+    argo_token = args.agk or os.environ.get("AGK") or os.environ.get("agk")
     if not argo_token:
         argo_token_input = input("请输入 Argo Tunnel Token (AGK) (例如: eyJhIjo...Ifs9, 若使用Cloudflare Zero Trust隧道请输入, 留空则使用临时隧道): ").strip()
         argo_token = argo_token_input or None # None if empty
@@ -348,7 +372,7 @@ def install(args):
         write_debug_log("Argo Token: Not provided, using Quick Tunnel.")
 
     # Custom Domain (agn)
-    custom_domain = args.agn or os.environ.get("agn")
+    custom_domain = args.agn or os.environ.get("DOMAIN") or os.environ.get("agn")
     if not custom_domain:
         domain_prompt = "请输入自定义域名 (例如: test.zmkk.fun"
         if argo_token:
@@ -368,6 +392,38 @@ def install(args):
     else:
         print("未提供自定义域名，将尝试在隧道启动后自动获取。")
         write_debug_log("Custom Domain (agn): Not provided, will attempt auto-detection.")
+
+    ssh_file = args.ssh_file or os.environ.get("SSH_FILE")
+    if ssh_file:
+        ssh_file = str(Path(ssh_file).expanduser().resolve())
+        if not ssh_file.endswith(".txt"):
+            print("错误: --ssh-file 必须指向 .txt 文件。")
+            sys.exit(1)
+        if not Path(ssh_file).exists():
+            print(f"错误: tmate 文件不存在: {ssh_file}")
+            sys.exit(1)
+    public_port_value = args.public_port or os.environ.get("PUBLIC_PORT") or port_vm_ws
+    try:
+        public_port = int(public_port_value)
+    except (TypeError, ValueError):
+        print("错误: PUBLIC_PORT 必须是整数。")
+        sys.exit(1)
+    if not (1 <= public_port <= 65535):
+        print("错误: public port 必须在 1-65535 范围内。")
+        sys.exit(1)
+    if ssh_file:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", public_port))
+        except OSError as exc:
+            print(f"错误: 网关端口 {public_port} 不可用: {exc}")
+            sys.exit(1)
+        finally:
+            probe.close()
+    singbox_port = port_vm_ws
+    if ssh_file and singbox_port == public_port:
+        singbox_port = choose_gateway_upstream_port(public_port)
+        print(f"UUID 文件网关使用端口 {public_port}，sing-box 内部端口 {singbox_port}")
 
 
     # --- 下载依赖 ---
@@ -449,18 +505,36 @@ def install(args):
     # --- 配置和启动 ---
     config_data = {
         "uuid_str": uuid_str,
-        "port_vm_ws": port_vm_ws,
-        "argo_token": argo_token, # Will be None if not provided
+        "port_vm_ws": public_port,
+        "singbox_port": singbox_port,
+        "gateway_port": public_port if ssh_file else singbox_port,
+        "ssh_file": ssh_file,
+        "ssh_file_url": (
+            f"https://{custom_domain}/{Path(ssh_file).name}"
+            if ssh_file and custom_domain else None
+        ),
+        "argo_token": None,
+        "tunnel_token_present": bool(argo_token),
         "custom_domain_agn": custom_domain, # Will be None if not provided
         "install_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config_data, f, indent=2)
-    write_debug_log(f"生成配置文件: {CONFIG_FILE} with data: {config_data}")
+    if argo_token:
+        token_fd = os.open(TUNNEL_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(token_fd, "w", encoding="utf-8") as token_stream:
+            token_stream.write(argo_token)
+        TUNNEL_TOKEN_FILE.chmod(0o600)
+    elif TUNNEL_TOKEN_FILE.exists():
+        TUNNEL_TOKEN_FILE.unlink()
+    write_debug_log(f"生成配置文件: {CONFIG_FILE} (tunnel token present: {bool(argo_token)})")
 
-    create_sing_box_config(port_vm_ws, uuid_str)
+    create_sing_box_config(singbox_port, uuid_str)
+    if ssh_file:
+        create_gateway_script(public_port, singbox_port, ssh_file)
     create_startup_script() # Now reads from config for token
-    setup_autostart()
+    if not args.no_autostart:
+        setup_autostart()
     start_services()
 
     final_domain = custom_domain
@@ -477,7 +551,11 @@ def install(args):
         sys.exit(1)
     
     if final_domain:
-        generate_links(final_domain, port_vm_ws, uuid_str)
+        if ssh_file:
+            config_data["ssh_file_url"] = f"https://{final_domain}/{Path(ssh_file).name}"
+            CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
+            print(f"tmate 预期文件地址: {config_data['ssh_file_url']}")
+        generate_links(final_domain, public_port, uuid_str)
     else: # This case should ideally not be reached if logic above is correct
         print("\033[31m最终域名未能确定，无法生成链接。\033[0m")
         sys.exit(1)
@@ -491,13 +569,16 @@ def setup_autostart():
         
         script_name_sb = (INSTALL_DIR / "start_sb.sh").resolve()
         script_name_cf = (INSTALL_DIR / "start_cf.sh").resolve()
+        script_name_gateway = (INSTALL_DIR / "start_gateway.sh").resolve()
 
         filtered_lines = [
             line for line in lines 
-            if str(script_name_sb) not in line and str(script_name_cf) not in line and line.strip()
+            if str(script_name_sb) not in line and str(script_name_cf) not in line and str(script_name_gateway) not in line and line.strip()
         ]
         
         filtered_lines.append(f"@reboot {script_name_sb} >/dev/null 2>&1")
+        if (INSTALL_DIR / "start_gateway.sh").exists():
+            filtered_lines.append(f"@reboot {script_name_gateway} >/dev/null 2>&1")
         filtered_lines.append(f"@reboot {script_name_cf} >/dev/null 2>&1")
         
         new_crontab = "\n".join(filtered_lines).strip() + "\n"
@@ -520,7 +601,7 @@ def uninstall():
     print("开始卸载服务...")
     
     # 停止服务
-    for pid_file_path in [SB_PID_FILE, ARGO_PID_FILE]:
+    for pid_file_path in [SB_PID_FILE, GATEWAY_PID_FILE, ARGO_PID_FILE]:
         if pid_file_path.exists():
             try:
                 pid = pid_file_path.read_text().strip()
@@ -534,8 +615,9 @@ def uninstall():
     # 强制停止 (如果还在运行)
     print("尝试强制终止可能残留的 sing-box 和 cloudflared 进程...")
     os.system("pkill -9 -f 'sing-box run -c sb.json' 2>/dev/null || true")
+    os.system(f"pkill -9 -f {shlex.quote(str(GATEWAY_SCRIPT_FILE))} 2>/dev/null || true")
     os.system("pkill -9 -f 'cloudflared tunnel --url' 2>/dev/null || true") # Quick Tunnel
-    os.system("pkill -9 -f 'cloudflared tunnel --no-autoupdate run --token' 2>/dev/null || true") # Named Tunnel
+    os.system("pkill -9 -f 'cloudflared tunnel --no-autoupdate run' 2>/dev/null || true") # Named Tunnel
 
     # 移除crontab项
     try:
@@ -544,10 +626,11 @@ def uninstall():
         
         script_name_sb_str = str((INSTALL_DIR / "start_sb.sh").resolve())
         script_name_cf_str = str((INSTALL_DIR / "start_cf.sh").resolve())
+        script_name_gateway_str = str((INSTALL_DIR / "start_gateway.sh").resolve())
 
         filtered_lines = [
             line for line in lines
-            if script_name_sb_str not in line and script_name_cf_str not in line and line.strip()
+            if script_name_sb_str not in line and script_name_cf_str not in line and script_name_gateway_str not in line and line.strip()
         ]
         
         new_crontab = "\n".join(filtered_lines).strip()
@@ -602,8 +685,18 @@ def upgrade():
 def check_status():
     sb_running = SB_PID_FILE.exists() and os.path.exists(f"/proc/{SB_PID_FILE.read_text().strip()}")
     cf_running = ARGO_PID_FILE.exists() and os.path.exists(f"/proc/{ARGO_PID_FILE.read_text().strip()}")
+    gateway_required = False
+    gateway_running = True
+    if CONFIG_FILE.exists():
+        try:
+            gateway_required = bool(json.loads(CONFIG_FILE.read_text()).get("ssh_file"))
+            gateway_running = GATEWAY_PID_FILE.exists() and os.path.exists(
+                f"/proc/{GATEWAY_PID_FILE.read_text().strip()}"
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            gateway_running = False
 
-    if sb_running and cf_running and LIST_FILE.exists():
+    if sb_running and cf_running and (not gateway_required or gateway_running) and LIST_FILE.exists():
         print("\033[36m╭───────────────────────────────────────────────────────────────╮\033[0m")
         print("\033[36m│                \033[33m✨ ArgoSB 运行状态 ✨                    \033[36m│\033[0m")
         print("\033[36m├───────────────────────────────────────────────────────────────┤\033[0m")
@@ -618,7 +711,7 @@ def check_status():
             if config.get("custom_domain_agn"):
                  domain_to_display = config["custom_domain_agn"]
                  print(f"\033[36m│ \033[32m配置域名 (agn): \033[0m{domain_to_display}")
-            elif not config.get("argo_token") and LOG_FILE.exists(): # Quick tunnel, try log
+            elif not config.get("tunnel_token_present", config.get("argo_token")) and LOG_FILE.exists(): # Quick tunnel, try log
                 log_content = LOG_FILE.read_text()
                 match = re.search(r'https://([a-zA-Z0-9.-]+\.trycloudflare\.com)', log_content)
                 if match:
@@ -642,6 +735,7 @@ def check_status():
     
     status_msgs = []
     if not sb_running: status_msgs.append("sing-box 未运行")
+    if gateway_required and not gateway_running: status_msgs.append("UUID 文件网关未运行")
     if not cf_running: status_msgs.append("cloudflared 未运行")
     if not LIST_FILE.exists(): status_msgs.append("节点信息文件未生成")
 
@@ -685,6 +779,117 @@ def create_sing_box_config(port_vm_ws, uuid_str):
     write_debug_log(f"sing-box配置已写入文件: {sb_config_file}")
     return True
 
+# 创建文件/WebSocket网关。Cloudflare只需要一个 origin 端口：
+# UUID.txt 由网关直接返回，其他请求（包括 sing-box 的 WebSocket 握手）转发到内部端口。
+def create_gateway_script(public_port, singbox_port, ssh_file):
+    if not ssh_file:
+        return None
+    ssh_path = Path(ssh_file).expanduser().resolve()
+    file_name = ssh_path.name
+    if not file_name.endswith(".txt"):
+        raise ValueError("--ssh-file 必须是 .txt 文件")
+
+    gateway_source = textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import select
+        import socket
+        import threading
+        from pathlib import Path
+        from urllib.parse import urlsplit
+
+        LISTEN_HOST = "127.0.0.1"
+        PUBLIC_PORT = __PUBLIC_PORT__
+        UPSTREAM_PORT = __UPSTREAM_PORT__
+        FILE_NAME = __FILE_NAME__
+        FILE_PATH = Path(__FILE_PATH__)
+        MAX_HEADER_SIZE = 65536
+
+        def read_request(client):
+            data = bytearray()
+            while b"\\r\\n\\r\\n" not in data and len(data) < MAX_HEADER_SIZE:
+                chunk = client.recv(8192)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            return bytes(data)
+
+        def send_file(client, method):
+            try:
+                body = FILE_PATH.read_bytes()
+            except OSError:
+                body = b"tmate session file is not ready\\n"
+                status = b"503 Service Unavailable"
+            else:
+                status = b"200 OK"
+            headers = (
+                b"HTTP/1.1 " + status + b"\\r\\n"
+                b"Content-Type: text/plain; charset=utf-8\\r\\n"
+                + b"Content-Length: " + str(len(body)).encode("ascii") + b"\\r\\n"
+                b"Cache-Control: no-store\\r\\nConnection: close\\r\\n\\r\\n"
+            )
+            client.sendall(headers)
+            if method != "HEAD":
+                client.sendall(body)
+
+        def relay(client, request):
+            upstream = socket.create_connection((LISTEN_HOST, UPSTREAM_PORT), timeout=10)
+            try:
+                upstream.settimeout(None)
+                upstream.sendall(request)
+                sockets = [client, upstream]
+                while sockets:
+                    readable, _, _ = select.select(sockets, [], [])
+                    for source in readable:
+                        target = upstream if source is client else client
+                        chunk = source.recv(65536)
+                        if not chunk:
+                            sockets.remove(source)
+                            try:
+                                target.shutdown(socket.SHUT_WR)
+                            except OSError:
+                                pass
+                            continue
+                        target.sendall(chunk)
+            finally:
+                upstream.close()
+
+        def handle(client):
+            try:
+                request = read_request(client)
+                if not request:
+                    return
+                first_line = request.split(b"\\r\\n", 1)[0].decode("latin1")
+                parts = first_line.split(" ", 2)
+                if len(parts) != 3:
+                    return
+                method, target, _ = parts
+                path = urlsplit(target).path
+                if path == "/" + FILE_NAME and method in ("GET", "HEAD"):
+                    send_file(client, method)
+                else:
+                    relay(client, request)
+            except (OSError, ValueError):
+                pass
+            finally:
+                client.close()
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((LISTEN_HOST, PUBLIC_PORT))
+        listener.listen(128)
+        while True:
+            client, _ = listener.accept()
+            threading.Thread(target=handle, args=(client,), daemon=True).start()
+    """)
+    gateway_source = gateway_source.replace("__PUBLIC_PORT__", str(public_port))
+    gateway_source = gateway_source.replace("__UPSTREAM_PORT__", str(singbox_port))
+    gateway_source = gateway_source.replace("__FILE_NAME__", repr(file_name))
+    gateway_source = gateway_source.replace("__FILE_PATH__", repr(str(ssh_path)))
+    GATEWAY_SCRIPT_FILE.write_text(gateway_source, encoding="utf-8")
+    GATEWAY_SCRIPT_FILE.chmod(0o755)
+    return GATEWAY_SCRIPT_FILE
+
+
 # 创建启动脚本
 def create_startup_script():
     if not CONFIG_FILE.exists():
@@ -692,51 +897,89 @@ def create_startup_script():
         return
 
     config = json.loads(CONFIG_FILE.read_text())
-    port_vm_ws = config["port_vm_ws"]
-    uuid_str = config["uuid_str"]
-    argo_token = config.get("argo_token") # Safely get token, might be None
-    
-    # sing-box启动脚本
+    public_port = int(config["port_vm_ws"])
+    singbox_port = int(config.get("singbox_port", public_port))
+    gateway_port = int(config.get("gateway_port", singbox_port))
+    ssh_file = config.get("ssh_file")
+    argo_token = TUNNEL_TOKEN_FILE.exists() or bool(config.get("argo_token"))
+    install_dir = shlex.quote(str(INSTALL_DIR.resolve()))
+
     sb_start_script_path = INSTALL_DIR / "start_sb.sh"
     sb_start_content = f'''#!/bin/bash
-cd {INSTALL_DIR.resolve()}
+cd {install_dir}
 ./sing-box run -c sb.json > sb.log 2>&1 &
-echo $! > {SB_PID_FILE.name}
+echo $! > {shlex.quote(SB_PID_FILE.name)}
 '''
     sb_start_script_path.write_text(sb_start_content)
     os.chmod(sb_start_script_path, 0o755)
 
-    # cloudflared启动脚本
-    cf_start_script_path = INSTALL_DIR / "start_cf.sh"
-    cf_cmd_base = f"./cloudflared tunnel --no-autoupdate"
-    # 使用与 sing-box 配置中一致的路径，确保 ?ed=2048 在这里也加上
-    ws_path_for_url = f"/{uuid_str[:8]}-vm?ed=2048" 
+    gateway_start_script_path = INSTALL_DIR / "start_gateway.sh"
+    if ssh_file and GATEWAY_SCRIPT_FILE.exists():
+        gateway_start_content = f'''#!/bin/bash
+cd {install_dir}
+{shlex.quote(sys.executable)} {shlex.quote(str(GATEWAY_SCRIPT_FILE))} > gateway.log 2>&1 &
+echo $! > {shlex.quote(GATEWAY_PID_FILE.name)}
+'''
+        gateway_start_script_path.write_text(gateway_start_content)
+        os.chmod(gateway_start_script_path, 0o755)
+    elif gateway_start_script_path.exists():
+        gateway_start_script_path.unlink()
 
-    if argo_token: # 使用命名隧道
-        cf_cmd = f"{cf_cmd_base} run --token {argo_token}"
-    else: # 使用临时隧道
-        cf_cmd = f"{cf_cmd_base} --url http://localhost:{port_vm_ws}{ws_path_for_url} --edge-ip-version auto --protocol http2"
-    
+    cf_start_script_path = INSTALL_DIR / "start_cf.sh"
+    cf_cmd_base = "./cloudflared tunnel --no-autoupdate"
+    origin_url = f"http://127.0.0.1:{gateway_port}"
+    if argo_token:
+        # Named tunnels read their hostname from the Cloudflare tunnel config;
+        # the local gateway is the single origin on gateway_port.
+        if TUNNEL_TOKEN_FILE.exists():
+            cf_cmd = f"{cf_cmd_base} run --token-file {shlex.quote(str(TUNNEL_TOKEN_FILE))}"
+        else:
+            cf_cmd = f"{cf_cmd_base} run --token {shlex.quote(str(config['argo_token']))}"
+    else:
+        cf_cmd = f"{cf_cmd_base} --url {origin_url} --edge-ip-version auto --protocol http2"
     cf_start_content = f'''#!/bin/bash
-cd {INSTALL_DIR.resolve()}
-{cf_cmd} > {LOG_FILE.name} 2>&1 &
-echo $! > {ARGO_PID_FILE.name}
+cd {install_dir}
+{cf_cmd} > {shlex.quote(LOG_FILE.name)} 2>&1 &
+echo $! > {shlex.quote(ARGO_PID_FILE.name)}
 '''
     cf_start_script_path.write_text(cf_start_content)
     os.chmod(cf_start_script_path, 0o755)
-    
-    write_debug_log("启动脚本已创建/更新。")
+    write_debug_log(
+        f"启动脚本已创建: public_port={public_port}, singbox_port={singbox_port}, "
+        f"gateway_port={gateway_port}, ssh_file={ssh_file}"
+    )
 
 # 启动服务
 def start_services():
     print("正在启动sing-box服务...")
     subprocess.run(str(INSTALL_DIR / "start_sb.sh"), shell=True)
-    
+    gateway_script = INSTALL_DIR / "start_gateway.sh"
+    if gateway_script.exists():
+        print("正在启动 UUID 文件网关...")
+        subprocess.run(str(gateway_script), shell=True)
+
     print("正在启动cloudflared服务...")
     subprocess.run(str(INSTALL_DIR / "start_cf.sh"), shell=True)
     
     print("等待服务启动 (约5秒)...")
     time.sleep(5)
+    config = json.loads(CONFIG_FILE.read_text())
+    for label, pid_file in (
+        ("sing-box", SB_PID_FILE),
+        ("cloudflared", ARGO_PID_FILE),
+        ("UUID 文件网关", GATEWAY_PID_FILE),
+    ):
+        if label == "UUID 文件网关" and not config.get("ssh_file"):
+            continue
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            raise RuntimeError(f"{label} 启动失败；请检查 {INSTALL_DIR} 下的日志")
+    for port in {int(config.get("singbox_port", config["port_vm_ws"])), int(config["gateway_port"])}:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                raise RuntimeError(f"本地端口 {port} 未监听；请检查 {INSTALL_DIR} 下的日志")
     write_debug_log("服务启动命令已执行。")
 
 # 获取tunnel域名 (仅用于Quick Tunnel)
