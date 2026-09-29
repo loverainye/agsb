@@ -22,7 +22,7 @@
   - [📁 文件结构](#-文件结构)
   - [✅ 优势特点](#-优势特点)
 
-- [Streamlit tmate 自动启动](#streamlit-tmate-自动启动)
+- [Streamlit Upterm 自动启动](#streamlit-upterm-自动启动)
 
 - [🌐 Glitch 网站保活脚本](#-glitch-网站保活脚本)
   - [🔥 主要功能](#-主要功能)
@@ -438,30 +438,24 @@ cd ~ && curl -fsSL https://raw.githubusercontent.com/zhumengkang/agsb/main/agsb-
 
 ---
 
-## Streamlit tmate 自动启动
+## Streamlit Upterm 自动启动
 
-`upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本会创建后台 tmate 会话并自动启动 `agsb-v2.py`；私有应用需先登录。服务器启动日志中只有 Uvicorn 信息时，先确认页面已加载。脚本执行后会立即输出 `Streamlit 启动脚本已执行`，tmate 连接成功后会在 Streamlit Community Cloud 的应用日志中输出 `tmate SSH 连接: ssh ...`。每次运行只在会话就绪后输出一次可写 SSH 地址，不再生成或上传 `<UUID>.txt`。
+`upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本先在后台启动 `agsb-v2.py`，再启动 Upterm；私有应用需先登录。只有 Uvicorn 日志时，先确认页面已加载。Upterm 就绪后，Streamlit Community Cloud 的应用日志会输出 `Upterm SSH connection: ssh ...`，失败时输出 `[upterm]` 诊断和退出码。连接命令不写入 TXT 文件，也不上传到第三方文件服务。
 
-通过环境变量配置启动参数：
+通过环境变量或 Streamlit Secrets 配置：
 
 ```bash
 export UUID="your-uuid"
-export PORT=49999
+export PORT=19999
 export AGK="your-cloudflare-tunnel-token"
 export DOMAIN="your.domain.example"
 ```
 
-`UUID` 用于 sing-box 节点配置，tmate 不使用它；tmate 本地 socket 默认为 `/tmp/tmate.sock`，可通过 `TMATE_SOCKET` 环境变量指定。
+默认启动的 Upterm 会话允许任何持有日志中 SSH 连接命令的人进入可写 shell。可选用 `UPTERM_AUTHORIZED_USER=github:your-username`、`UPTERM_AUTHORIZED_KEY`（一行 SSH 公钥）或 `UPTERM_AUTHORIZED_KEYS`（每行一个原始 SSH 公钥的文件路径）限制连接者。请限制 Streamlit 应用日志的访问权限。`UUID` 仅用于 sing-box，Upterm 不使用它。
 
-如果应用用户没有 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，脚本会在启动 tmate 前用 `ssh-keygen` 生成无口令 Ed25519 身份密钥，私钥权限为 `0600`。同一容器内重跑脚本时会复用已有密钥；全新容器会重新生成。私钥内容不会写入日志。
+首次启动从 [Upterm 官方仓库](https://github.com/owenthereal/upterm)下载固定的 v0.33.0 Linux 发布包并校验 SHA-256；也可用 `UPTERM_BIN` 指向预装的可执行文件。Upterm 使用 `wss://uptermd.upterm.dev` 的 443 端口，并固定官方中继主机密钥，不需要在容器内运行 `sshd`。日志中的连接命令可能包含 `upterm proxy`，这种情况下连接端也需要安装 Upterm。Streamlit 重跑时会查询并重用已有会话；授权配置改变时会停止旧会话并建立新会话。
 
-如果本地 tmate 会话已建立但远端地址未就绪，日志会区分已识别的协议、认证和网络错误；其他情况会从应用容器检测默认服务器 `ssh.tmate.io:22` 的 DNS/TCP 连通性，不输出原始 tmate 消息。
-
-Cloudflare 隧道使用 `AGK` 启动。`PORT` 是 sing-box 的本地端口，从 `PORT` 环境变量读取（未设置时默认 `49999`）；`DOMAIN` 是 Cloudflare 的 Public Hostname，与 Streamlit 应用域名分开配置。tmate SSH 地址只出现在 Streamlit 日志中。
-
-在 Cloudflare Zero Trust 的该命名隧道中，需将 `DOMAIN` 的 Public Hostname 服务地址设为 `http://localhost:PORT`（将 `PORT` 替换为实际值）。隧道 token 仅用于连接已有隧道，不能自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。
-
-tmate SSH 地址允许连接可写会话。请限制 Streamlit 应用日志的访问权限。更新部署后请在 Streamlit 管理页重启应用，使旧的静态服务设置失效并清理旧的端口占用进程。新实例不会从 Git 加载旧版本运行时生成的 TXT 文件。
+Cloudflare 隧道仍使用 `AGK`。`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或 19999 端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`。隧道 token 仅连接已有隧道，不会自动创建 Public Hostname 路由。Streamlit 启动不修改 crontab。
 
 ## 🌐 Glitch 网站保活脚本
 
