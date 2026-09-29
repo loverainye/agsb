@@ -145,10 +145,43 @@ class TmateManager:
         except Exception as e:
             print(f"✗ 下载tmate失败: {e}", flush=True)
             return False
+
+    def ensure_ssh_identity(self):
+        ssh_dir = USER_HOME / ".ssh"
+        if any((ssh_dir / name).is_file() for name in ("id_ed25519", "id_rsa")):
+            print("✓ 已检测到 SSH 身份密钥", flush=True)
+            return True
+
+        key_path = ssh_dir / "id_ed25519"
+        try:
+            ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ssh_dir.chmod(0o700)
+            print("未检测到 SSH 身份密钥，正在生成 Ed25519 密钥...", flush=True)
+            result = subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0 or not key_path.is_file():
+                print(f"✗ 生成 SSH 身份密钥失败，ssh-keygen 退出码: {result.returncode}", flush=True)
+                return False
+            key_path.chmod(0o600)
+            print("✓ SSH 身份密钥已就绪", flush=True)
+            return True
+        except FileNotFoundError:
+            print("✗ 系统缺少 ssh-keygen，请安装 openssh-client", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"✗ 生成 SSH 身份密钥失败: {type(exc).__name__}", flush=True)
+        return False
     
     def start_tmate(self):
         """启动tmate并获取会话信息"""
         print("正在启动tmate...", flush=True)
+        if not self.ensure_ssh_identity():
+            return False
         try:
             if self.socket_path.exists():
                 result = self._tmate("list-sessions", timeout=5)
