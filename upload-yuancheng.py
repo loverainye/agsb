@@ -12,15 +12,12 @@ import re
 import uuid as uuid_module
 import urllib.request
 from pathlib import Path
-from datetime import datetime
 
 # 配置
 TMATE_URL = os.environ.get(
     "TMATE_URL", "https://github.com/loverainye/agsb/raw/main/tmate"
 )
-UPLOAD_API = os.environ.get("UPLOAD_API", "https://file.zmkk.fun/api/upload")
 USER_HOME = Path.home()
-DEFAULT_FILE_DIR = Path(os.environ.get("SSH_FILE_DIR", Path.cwd()))
 TMATE_SOCKET = os.environ.get("TMATE_SOCKET", "/tmp/tmate.sock")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DOMAIN_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
@@ -63,14 +60,11 @@ def _download(url, destination):
     temporary.replace(destination)
 
 class TmateManager:
-    def __init__(self, uuid_value=None, file_dir=DEFAULT_FILE_DIR, socket_path=None):
+    def __init__(self, uuid_value=None, socket_path=None):
         uuid_value = uuid_value or _first_env("UUID", "uuid") or str(uuid_module.uuid4())
         self.uuid = _safe_name(uuid_value, "uuid")
-        self.file_dir = Path(file_dir).expanduser().resolve()
-        self.file_dir.mkdir(parents=True, exist_ok=True)
         self.tmate_path = USER_HOME / "tmate"
         self.socket_path = Path(socket_path or f"{TMATE_SOCKET}.{self.uuid}")
-        self.ssh_info_path = self.file_dir / f"{self.uuid}.txt"
         self.tmate_process = None
         self.session_info = {}
 
@@ -192,109 +186,7 @@ class TmateManager:
         if result.returncode != 0 or not address or address.startswith("#{"):
             return False
         self.session_info["ssh_rw"] = address
-        for key, format_string in (
-            ("web_ro", "#{tmate_web_ro}"),
-            ("ssh_ro", "#{tmate_ssh_ro}"),
-            ("web_rw", "#{tmate_web}"),
-        ):
-            try:
-                result = self._tmate("display", "-p", format_string, timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            value = result.stdout.strip()
-            if result.returncode == 0 and value and not value.startswith("#{"):
-                self.session_info[key] = value
         return True
-    
-    def save_ssh_info(self):
-        """保存SSH信息到文件"""
-        try:
-            content = f"""Tmate SSH 会话信息
-UUID: {self.uuid}
-创建时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-"""
-            
-            if 'web_ro' in self.session_info:
-                content += f"web session read only: {self.session_info['web_ro']}\n"
-            if 'ssh_ro' in self.session_info:
-                content += f"ssh session read only: {self.session_info['ssh_ro']}\n"
-            if 'web_rw' in self.session_info:
-                content += f"web session: {self.session_info['web_rw']}\n"
-            if 'ssh_rw' in self.session_info:
-                content += f"ssh session: {self.session_info['ssh_rw']}\n"
-            
-            temporary = self.ssh_info_path.with_suffix(self.ssh_info_path.suffix + '.tmp')
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(content)
-            temporary.chmod(0o600)
-            temporary.replace(self.ssh_info_path)
-            
-            print(f"✓ SSH信息已保存到: {self.ssh_info_path}")
-            return True
-            
-        except Exception as e:
-            print(f"✗ 保存SSH信息失败: {e}")
-            return False
-    
-    def upload_to_api(self, user_name=None):
-        """上传SSH信息文件到API"""
-        try:
-            import requests
-            if not self.ssh_info_path.exists():
-                print("✗ SSH信息文件不存在")
-                return False
-            
-            print("正在上传SSH信息到API...")
-            
-            # 读取文件内容
-            with open(self.ssh_info_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # 创建临时文件用于上传
-            file_name = f"{_safe_name(user_name or self.uuid, 'file name')}.txt"
-            temp_file = USER_HOME / file_name
-            
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            # 上传文件
-            with open(temp_file, 'rb') as f:
-                files = {'file': (file_name, f)}
-                response = requests.post(UPLOAD_API, files=files, timeout=30)
-            
-            # 删除临时文件
-            if temp_file.exists():
-                temp_file.unlink()
-            
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    if result.get('success') or result.get('url'):
-                        url = result.get('url', '')
-                        print(f"✓ 文件上传成功!")
-                        print(f"  上传URL: {url}")
-                        
-                        # 保存URL到文件
-                        url_file = USER_HOME / "ssh_upload_url.txt"
-                        with open(url_file, 'w') as f:
-                            f.write(url)
-                        print(f"  URL已保存到: {url_file}")
-                        return True
-                    else:
-                        print(f"✗ API返回错误: {result}")
-                        return False
-                except Exception as e:
-                    print(f"✗ 解析API响应失败: {e}")
-                    return False
-            else:
-                print(f"✗ 上传失败，状态码: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            print(f"✗ 上传到API失败: {e}")
-            return False
     
     def cleanup(self):
         """清理资源 - 不终止tmate会话"""
@@ -311,14 +203,12 @@ def signal_handler(signum, frame):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="启动 tmate 和 ArgoSB")
-    parser.add_argument("--uuid", default=None, help="tmate 文件名（不含 .txt）")
-    parser.add_argument("--port", type=int, default=None, help="Cloudflare origin 端口")
+    parser.add_argument("--uuid", default=None, help="tmate 会话 UUID")
+    parser.add_argument("--port", type=int, default=None, help="sing-box 本地端口")
     parser.add_argument("--agk", default=None, help="Cloudflare tunnel token")
     parser.add_argument("--domain", default=None, help="Cloudflare hostname")
-    parser.add_argument("--file-dir", default=str(DEFAULT_FILE_DIR))
     parser.add_argument("--socket", default=None)
     parser.add_argument("--no-install", action="store_true")
-    parser.add_argument("--upload", action="store_true", help="兼容旧版 API 上传")
     # Streamlit adds its own command line options; ignore unknown options.
     args, _ = parser.parse_known_args(argv)
     return args
@@ -357,33 +247,42 @@ def _is_running(pid):
     return True
 
 
-def _installer_already_started(uuid_value):
+def _installer_already_started(settings):
+    uuid_value = str(settings["uuid"])
+    port = str(settings["port"])
     marker = USER_HOME / ".agsb" / f"launcher-{uuid_value}.pid"
     try:
         if marker.exists():
             pid = int(marker.read_text().strip())
-            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
-            if b"agsb-v2.py" in command_line and uuid_value.encode() in command_line:
+            arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if (any(b"agsb-v2.py" in item for item in arguments)
+                    and uuid_value.encode() in arguments
+                    and b"--ssh-file" not in arguments
+                    and b"--port" in arguments
+                    and arguments[arguments.index(b"--port") + 1] == port.encode()):
                 return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
     config_file = USER_HOME / ".agsb" / "config.json"
-    pid_files = ["sbpid.log", "sbargopid.log", "gatewaypid.log"]
     try:
         config = json.loads(config_file.read_text())
-        if config.get("uuid_str") != uuid_value:
+        if (config.get("uuid_str") != uuid_value
+                or config.get("ssh_file")
+                or int(config.get("port_vm_ws", 0)) != int(port)
+                or config.get("custom_domain_agn") != settings["domain"]):
             return False
-        if not config.get("ssh_file"):
-            pid_files.remove("gatewaypid.log")
-        return all(_is_running(int((config_file.parent / name).read_text().strip())) for name in pid_files)
+        return all(
+            _is_running(int((config_file.parent / name).read_text().strip()))
+            for name in ("sbpid.log", "sbargopid.log")
+        )
     except (OSError, ValueError, KeyError):
         return False
 
 
-def launch_installer(settings, ssh_file):
+def launch_installer(settings):
     """Run agsb-v2 without requiring a second, manual SSH hop."""
     uuid_value = str(settings["uuid"])
-    if _installer_already_started(uuid_value):
+    if _installer_already_started(settings):
         print(f"ArgoSB 安装流程已在后台运行，UUID={uuid_value}")
         return None
 
@@ -394,8 +293,6 @@ def launch_installer(settings, ssh_file):
     arguments = [
         "install", "--uuid", uuid_value,
         "--port", str(settings["port"]),
-        "--ssh-file", str(ssh_file),
-        "--public-port", str(settings["port"]),
         "--no-autostart",
     ]
     if settings["domain"]:
@@ -429,7 +326,7 @@ def main(argv=None):
         print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN")
         return False
 
-    manager = TmateManager(settings["uuid"], args.file_dir, args.socket)
+    manager = TmateManager(settings["uuid"], args.socket)
     
     # 只在主线程中注册信号处理器
     try:
@@ -447,10 +344,10 @@ def main(argv=None):
         if not manager.download_tmate():
             return False
         
-        # 网关会在 tmate 文件尚未生成时返回 503，安装过程可与连接等待并行。
+        # sing-box/Cloudflare 与 tmate 的连接等待独立运行。
         installer_process = None
         if not args.no_install:
-            installer_process = launch_installer(settings, manager.ssh_info_path)
+            installer_process = launch_installer(settings)
 
         # 2. 启动tmate
         if not manager.start_tmate():
@@ -459,19 +356,9 @@ def main(argv=None):
                 print("ArgoSB 安装进程仍在运行" if status is None else f"ArgoSB 安装进程退出码: {status}")
             return False
         
-        # 3. 保存SSH信息
-        if not manager.save_ssh_info():
-            return False
-        
         print("\n=== 所有操作完成 ===")
         print("✓ Tmate会话已在后台运行")
-        print(f"✓ 会话信息已保存到: {manager.ssh_info_path}")
-        if settings["domain"]:
-            print(f"预期文件地址: https://{settings['domain']}/{settings['uuid']}.txt")
-        if args.upload:
-            uploaded_url = manager.upload_to_api(settings["uuid"])
-            if uploaded_url:
-                print(f"✓ 兼容上传地址: {uploaded_url}")
+        print(f"tmate SSH 连接: {manager.session_info['ssh_rw']}", flush=True)
         print("\ntmate 已就绪；ArgoSB 服务启动情况请查看后台日志。")
         
         return True
