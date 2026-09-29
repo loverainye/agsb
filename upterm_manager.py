@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 UPTERM_VERSION = "v0.33.0"
@@ -34,6 +35,24 @@ def _file_sha256(path):
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_official_proxy(option, user):
+    if not option.startswith("ProxyCommand="):
+        return False
+    try:
+        proxy_args = shlex.split(option.partition("=")[2])
+        if len(proxy_args) != 3 or proxy_args[:2] != ["upterm", "proxy"]:
+            return False
+        relay = urlsplit(proxy_args[2].replace("%%", "%"))
+        proxy_user = unquote(relay.username or "")
+        if relay.password is not None:
+            proxy_user += ":" + unquote(relay.password)
+        return (relay.scheme == "wss" and relay.hostname == "uptermd.upterm.dev"
+                and relay.port in (None, 443) and relay.path in ("", "/")
+                and not relay.query and not relay.fragment and proxy_user == user)
+    except ValueError:
+        return False
 
 
 def _valid_public_key(line):
@@ -190,18 +209,20 @@ class UptermManager:
             arguments = shlex.split(command)
         except ValueError:
             arguments = []
-        if (len(arguments) == 2 and arguments[0] == "ssh"):
-            expected_host = "uptermd.upterm.dev"
-        elif (len(arguments) == 4 and arguments[:2] == ["ssh", "-o"]
-              and arguments[2].startswith("ProxyCommand=upterm proxy wss://")):
-            expected_host = "uptermd.upterm.dev:443"
-        else:
-            expected_host = None
         user, separator, host = arguments[-1].rpartition("@") if arguments else ("", "", "")
-        if not separator or not user or host != expected_host:
-            print("Upterm: cannot derive direct SSH command from session data", flush=True)
-            return False
-        self.connection_command = f"ssh {shlex.quote(user + '@uptermd.upterm.dev')}"
+        direct = (
+            separator and user and (
+                (len(arguments) == 2 and arguments[0] == "ssh" and host == "uptermd.upterm.dev")
+                or (len(arguments) == 4 and arguments[:2] == ["ssh", "-o"]
+                    and host == "uptermd.upterm.dev:443"
+                    and _is_official_proxy(arguments[2], user))
+            )
+        )
+        if direct:
+            self.connection_command = f"ssh {shlex.quote(user + '@uptermd.upterm.dev')}"
+        else:
+            self.connection_command = command
+            print("Upterm: direct SSH conversion unavailable; logging original connection command", flush=True)
         print(f"Upterm SSH connection: {self.connection_command}", flush=True)
         return True
 
