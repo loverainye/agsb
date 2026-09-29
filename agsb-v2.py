@@ -399,9 +399,6 @@ def install(args):
         if not ssh_file.endswith(".txt"):
             print("错误: --ssh-file 必须指向 .txt 文件。")
             sys.exit(1)
-        if not Path(ssh_file).exists():
-            print(f"错误: tmate 文件不存在: {ssh_file}")
-            sys.exit(1)
     public_port_value = args.public_port or os.environ.get("PUBLIC_PORT") or port_vm_ws
     try:
         public_port = int(public_port_value)

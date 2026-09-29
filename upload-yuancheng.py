@@ -83,15 +83,50 @@ class TmateManager:
             check=False,
         )
 
-    def _wait_for_session_info(self):
-        deadline = time.monotonic() + 30
+    def _wait_for_session_info(self, timeout=45):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._tmate("list-sessions", timeout=5).returncode == 0:
-                self.get_session_info()
-                if self.session_info.get("ssh_rw"):
+            try:
+                local_session = self._tmate("list-sessions", timeout=5)
+                if local_session.returncode == 0 and self.get_session_info():
                     return True
-            time.sleep(0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            time.sleep(1)
         return False
+
+    def failure_reason(self):
+        """Return a fixed status category without exposing tmate session output."""
+        ssh_dir = USER_HOME / ".ssh"
+        missing_identity = not os.environ.get("SSH_AUTH_SOCK") and not any(
+            (ssh_dir / name).is_file() for name in ("id_ed25519", "id_rsa")
+        )
+        try:
+            local_session = self._tmate("list-sessions", timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            local_session = None
+        if local_session is None or local_session.returncode != 0:
+            if missing_identity:
+                return "未检测到本地 SSH 身份密钥（id_ed25519 或 id_rsa）"
+            if self.tmate_process is not None:
+                exit_code = self.tmate_process.poll()
+                if exit_code is not None:
+                    return f"tmate 启动命令退出，退出码 {exit_code}；本地会话未建立"
+            return "tmate 本地会话未建立"
+        try:
+            result = self._tmate("show-messages", timeout=5)
+            messages = result.stdout.lower() if result.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            messages = ""
+        if "ssh keys not found" in messages:
+            return "tmate 未找到 SSH 身份密钥"
+        if "lookup failure" in messages or "failed to resolve hostname" in messages:
+            return "tmate 服务器 DNS 解析失败"
+        if any(value in messages for value in ("timeout connecting", "error connecting", "connection refused")):
+            return "无法连接 tmate 服务器，请检查出站 TCP 网络连接"
+        if missing_identity:
+            return "未检测到本地 SSH 身份密钥（id_ed25519 或 id_rsa）"
+        return "本地会话已建立，但远端 SSH 地址尚未就绪；请检查出站网络连接"
         
     def download_tmate(self):
         """下载tmate文件到用户目录"""
@@ -125,7 +160,10 @@ class TmateManager:
             if self.socket_path.exists():
                 result = self._tmate("list-sessions", timeout=5)
                 if result.returncode == 0:
-                    return self._wait_for_session_info()
+                    if self._wait_for_session_info():
+                        return True
+                    print(f"✗ tmate 会话未就绪：{self.failure_reason()}")
+                    return False
                 self.socket_path.unlink()
             # 启动tmate进程 - 分离模式，后台运行
             self.tmate_process = subprocess.Popen(
@@ -136,7 +174,7 @@ class TmateManager:
             )
             if self._wait_for_session_info():
                 return True
-            print("✗ 等待tmate会话超时")
+            print(f"✗ tmate 会话未就绪：{self.failure_reason()}")
             return False
             
         except Exception as e:
@@ -145,56 +183,28 @@ class TmateManager:
     
     def get_session_info(self):
         """获取tmate会话信息"""
+        self.session_info.clear()
         try:
-            self.session_info.clear()
-            # 获取只读web会话
-            result = subprocess.run(
-                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_web_ro}"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
-                self.session_info['web_ro'] = result.stdout.strip()
-            
-            # 获取只读SSH会话
-            result = subprocess.run(
-                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_ssh_ro}"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
-                self.session_info['ssh_ro'] = result.stdout.strip()
-            
-            # 获取可写web会话
-            result = subprocess.run(
-                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_web}"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
-                self.session_info['web_rw'] = result.stdout.strip()
-            
-            # 获取可写SSH会话
-            result = subprocess.run(
-                [str(self.tmate_path), "-S", str(self.socket_path), "display", "-p", "#{tmate_ssh}"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip() and not result.stdout.strip().startswith("#{"):
-                self.session_info['ssh_rw'] = result.stdout.strip()
-                
-            # 显示会话信息
-            if self.session_info:
-                print("\n✓ Tmate会话已创建:")
-                if 'web_ro' in self.session_info:
-                    print(f"  只读Web会话: {self.session_info['web_ro']}")
-                if 'ssh_ro' in self.session_info:
-                    print(f"  只读SSH会话: {self.session_info['ssh_ro']}")
-                if 'web_rw' in self.session_info:
-                    print(f"  可写Web会话: {self.session_info['web_rw']}")
-                if 'ssh_rw' in self.session_info:
-                    print(f"  可写SSH会话: {self.session_info['ssh_rw']}")
-            else:
-                print("✗ 未能获取到会话信息")
-                
-        except Exception as e:
-            print(f"✗ 获取会话信息失败: {e}")
+            result = self._tmate("display", "-p", "#{tmate_ssh}", timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        address = result.stdout.strip()
+        if result.returncode != 0 or not address or address.startswith("#{"):
+            return False
+        self.session_info["ssh_rw"] = address
+        for key, format_string in (
+            ("web_ro", "#{tmate_web_ro}"),
+            ("ssh_ro", "#{tmate_ssh_ro}"),
+            ("web_rw", "#{tmate_web}"),
+        ):
+            try:
+                result = self._tmate("display", "-p", format_string, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            value = result.stdout.strip()
+            if result.returncode == 0 and value and not value.startswith("#{"):
+                self.session_info[key] = value
+        return True
     
     def save_ssh_info(self):
         """保存SSH信息到文件"""
@@ -437,8 +447,16 @@ def main(argv=None):
         if not manager.download_tmate():
             return False
         
+        # 网关会在 tmate 文件尚未生成时返回 503，安装过程可与连接等待并行。
+        installer_process = None
+        if not args.no_install:
+            installer_process = launch_installer(settings, manager.ssh_info_path)
+
         # 2. 启动tmate
         if not manager.start_tmate():
+            if installer_process is not None:
+                status = installer_process.poll()
+                print("ArgoSB 安装进程仍在运行" if status is None else f"ArgoSB 安装进程退出码: {status}")
             return False
         
         # 3. 保存SSH信息
@@ -454,8 +472,6 @@ def main(argv=None):
             uploaded_url = manager.upload_to_api(settings["uuid"])
             if uploaded_url:
                 print(f"✓ 兼容上传地址: {uploaded_url}")
-        if not args.no_install:
-            launch_installer(settings, manager.ssh_info_path)
         print("\ntmate 已就绪；ArgoSB 服务启动情况请查看后台日志。")
         
         return True
