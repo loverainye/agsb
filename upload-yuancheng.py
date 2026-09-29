@@ -60,11 +60,9 @@ def _download(url, destination):
     temporary.replace(destination)
 
 class TmateManager:
-    def __init__(self, uuid_value=None, socket_path=None):
-        uuid_value = uuid_value or _first_env("UUID", "uuid") or str(uuid_module.uuid4())
-        self.uuid = _safe_name(uuid_value, "uuid")
+    def __init__(self, socket_path=None):
         self.tmate_path = USER_HOME / "tmate"
-        self.socket_path = Path(socket_path or f"{TMATE_SOCKET}.{self.uuid}")
+        self.socket_path = Path(socket_path or TMATE_SOCKET)
         self.tmate_process = None
         self.session_info = {}
 
@@ -125,8 +123,9 @@ class TmateManager:
     def download_tmate(self):
         """下载tmate文件到用户目录"""
         if self.tmate_path.exists() and os.access(self.tmate_path, os.X_OK):
+            print(f"tmate 已存在，跳过下载: {self.tmate_path}", flush=True)
             return True
-        print(f"正在下载tmate: {TMATE_URL}")
+        print(f"正在下载tmate: {TMATE_URL}", flush=True)
         try:
             _download(TMATE_URL, self.tmate_path)
             # 给tmate添加执行权限
@@ -144,19 +143,19 @@ class TmateManager:
             return True
             
         except Exception as e:
-            print(f"✗ 下载tmate失败: {e}")
+            print(f"✗ 下载tmate失败: {e}", flush=True)
             return False
     
     def start_tmate(self):
         """启动tmate并获取会话信息"""
-        print("正在启动tmate...")
+        print("正在启动tmate...", flush=True)
         try:
             if self.socket_path.exists():
                 result = self._tmate("list-sessions", timeout=5)
                 if result.returncode == 0:
                     if self._wait_for_session_info():
                         return True
-                    print(f"✗ tmate 会话未就绪：{self.failure_reason()}")
+                    print(f"✗ tmate 会话未就绪：{self.failure_reason()}", flush=True)
                     return False
                 self.socket_path.unlink()
             # 启动tmate进程 - 分离模式，后台运行
@@ -168,11 +167,11 @@ class TmateManager:
             )
             if self._wait_for_session_info():
                 return True
-            print(f"✗ tmate 会话未就绪：{self.failure_reason()}")
+            print(f"✗ tmate 会话未就绪：{self.failure_reason()}", flush=True)
             return False
             
         except Exception as e:
-            print(f"✗ 启动tmate失败: {e}")
+            print(f"✗ 启动tmate失败: {e}", flush=True)
             return False
     
     def get_session_info(self):
@@ -203,7 +202,7 @@ def signal_handler(signum, frame):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="启动 tmate 和 ArgoSB")
-    parser.add_argument("--uuid", default=None, help="tmate 会话 UUID")
+    parser.add_argument("--uuid", default=None, help="sing-box 节点 UUID")
     parser.add_argument("--port", type=int, default=None, help="sing-box 本地端口")
     parser.add_argument("--agk", default=None, help="Cloudflare tunnel token")
     parser.add_argument("--domain", default=None, help="Cloudflare hostname")
@@ -311,22 +310,23 @@ def launch_installer(settings):
             start_new_session=True, env=child_env
         )
     marker.write_text(str(process.pid), encoding="ascii")
-    print(f"ArgoSB 已在后台启动，日志: {log_path}")
+    print(f"ArgoSB 已在后台启动，日志: {log_path}", flush=True)
     return process
 
 def main(argv=None):
+    print("Streamlit 启动脚本已执行", flush=True)
     args = parse_args(argv)
     try:
         settings = resolve_settings(args)
     except ValueError as exc:
-        print(f"配置错误: {exc}")
+        print(f"配置错误: {exc}", flush=True)
         return False
 
     if not args.no_install and (not settings["agk"] or not settings["domain"]):
-        print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN")
+        print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN", flush=True)
         return False
 
-    manager = TmateManager(settings["uuid"], args.socket)
+    manager = TmateManager(socket_path=args.socket)
     
     # 只在主线程中注册信号处理器
     try:
@@ -335,10 +335,10 @@ def main(argv=None):
         signal_handler.manager = manager  # 保存引用用于信号处理
     except ValueError:
         # 如果不在主线程中（如Streamlit环境），跳过信号处理器注册
-        print("⚠ 检测到非主线程环境，跳过信号处理器注册")
+        print("⚠ 检测到非主线程环境，跳过信号处理器注册", flush=True)
     
     try:
-        print("=== Tmate SSH 会话管理器 ===")
+        print("=== Tmate SSH 会话管理器 ===", flush=True)
         
         # 1. 下载tmate
         if not manager.download_tmate():
@@ -353,7 +353,7 @@ def main(argv=None):
         if not manager.start_tmate():
             if installer_process is not None:
                 status = installer_process.poll()
-                print("ArgoSB 安装进程仍在运行" if status is None else f"ArgoSB 安装进程退出码: {status}")
+                print("ArgoSB 安装进程仍在运行" if status is None else f"ArgoSB 安装进程退出码: {status}", flush=True)
             return False
         
         print("\n=== 所有操作完成 ===")
@@ -364,7 +364,7 @@ def main(argv=None):
         return True
             
     except Exception as e:
-        print(f"✗ 程序执行出错: {e}")
+        print(f"✗ 程序执行出错: {e}", flush=True)
         return False
     finally:
         manager.cleanup()

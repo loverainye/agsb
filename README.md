@@ -440,7 +440,7 @@ cd ~ && curl -fsSL https://raw.githubusercontent.com/zhumengkang/agsb/main/agsb-
 
 ## Streamlit tmate 自动启动
 
-`upload-yuancheng.py` 是 Streamlit 入口。启动时它会创建后台 tmate 会话并自动启动 `agsb-v2.py`。打开应用根页运行脚本；tmate 连接成功后，在 Streamlit Community Cloud 的应用管理页查看日志，查找 `tmate SSH 连接: ssh ...`。每次运行只在会话就绪后输出一次可写 SSH 地址，不再生成或上传 `<UUID>.txt`。
+`upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本会创建后台 tmate 会话并自动启动 `agsb-v2.py`；私有应用需先登录。服务器启动日志中只有 Uvicorn 信息时，先确认页面已加载。脚本执行后会立即输出 `Streamlit 启动脚本已执行`，tmate 连接成功后会在 Streamlit Community Cloud 的应用日志中输出 `tmate SSH 连接: ssh ...`。每次运行只在会话就绪后输出一次可写 SSH 地址，不再生成或上传 `<UUID>.txt`。
 
 通过环境变量配置启动参数：
 
@@ -450,6 +450,8 @@ export PORT=49999
 export AGK="your-cloudflare-tunnel-token"
 export DOMAIN="your.domain.example"
 ```
+
+`UUID` 用于 sing-box 节点配置，tmate 不使用它；tmate 本地 socket 默认为 `/tmp/tmate.sock`，可通过 `TMATE_SOCKET` 环境变量指定。
 
 Cloudflare 隧道使用 `AGK` 启动。`PORT` 是 sing-box 的本地端口，从 `PORT` 环境变量读取（未设置时默认 `49999`）；`DOMAIN` 是 Cloudflare 的 Public Hostname，与 Streamlit 应用域名分开配置。tmate SSH 地址只出现在 Streamlit 日志中。
 
