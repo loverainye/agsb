@@ -455,6 +455,8 @@ export DOMAIN="your.domain.example"
 
 如果应用用户没有 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，脚本会在启动 tmate 前用 `ssh-keygen` 生成无口令 Ed25519 身份密钥，私钥权限为 `0600`。同一容器内重跑脚本时会复用已有密钥；全新容器会重新生成。私钥内容不会写入日志。
 
+如果本地 tmate 会话已建立但远端地址未就绪，日志会区分已识别的协议、认证和网络错误；其他情况会从应用容器检测默认服务器 `ssh.tmate.io:22` 的 DNS/TCP 连通性，不输出原始 tmate 消息。
+
 Cloudflare 隧道使用 `AGK` 启动。`PORT` 是 sing-box 的本地端口，从 `PORT` 环境变量读取（未设置时默认 `49999`）；`DOMAIN` 是 Cloudflare 的 Public Hostname，与 Streamlit 应用域名分开配置。tmate SSH 地址只出现在 Streamlit 日志中。
 
 在 Cloudflare Zero Trust 的该命名隧道中，需将 `DOMAIN` 的 Public Hostname 服务地址设为 `http://localhost:PORT`（将 `PORT` 替换为实际值）。隧道 token 仅用于连接已有隧道，不能自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。

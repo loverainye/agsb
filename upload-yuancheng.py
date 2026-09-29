@@ -9,6 +9,7 @@ import signal
 import argparse
 import json
 import re
+import socket
 import uuid as uuid_module
 import urllib.request
 from pathlib import Path
@@ -112,13 +113,34 @@ class TmateManager:
             messages = ""
         if "ssh keys not found" in messages:
             return "tmate 未找到 SSH 身份密钥"
+        if "protocol mismatch" in messages or "protocol version mismatch" in messages:
+            return "tmate 与服务器协议不兼容，请检查二进制版本"
+        if "cannot authenticate server" in messages:
+            return "tmate 无法验证服务器身份，请检查服务器指纹配置"
+        if any(value in messages for value in ("public key authentication error", "access denied", "authentication failed")):
+            return "tmate 服务器拒绝 SSH 身份密钥"
         if "lookup failure" in messages or "failed to resolve hostname" in messages:
             return "tmate 服务器 DNS 解析失败"
         if any(value in messages for value in ("timeout connecting", "error connecting", "connection refused")):
             return "无法连接 tmate 服务器，请检查出站 TCP 网络连接"
         if missing_identity:
             return "未检测到本地 SSH 身份密钥（id_ed25519 或 id_rsa）"
-        return "本地会话已建立，但远端 SSH 地址尚未就绪；请检查出站网络连接"
+        return self._probe_default_server()
+
+    @staticmethod
+    def _probe_default_server():
+        """Check only the default tmate TCP endpoint; never log remote session data."""
+        try:
+            with socket.create_connection(("ssh.tmate.io", 22), timeout=4):
+                return "默认服务器 ssh.tmate.io:22 的 TCP 连接可达，但 tmate 远端会话未就绪"
+        except socket.gaierror:
+            return "容器无法解析默认 tmate 服务器 ssh.tmate.io"
+        except TimeoutError:
+            return "容器连接默认 tmate 服务器 ssh.tmate.io:22 超时，出站 TCP 22 可能受限"
+        except ConnectionRefusedError:
+            return "默认 tmate 服务器 ssh.tmate.io:22 拒绝连接"
+        except OSError:
+            return "容器无法连接默认 tmate 服务器 ssh.tmate.io:22"
         
     def download_tmate(self):
         """下载tmate文件到用户目录"""
