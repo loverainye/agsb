@@ -1,25 +1,23 @@
 import base64
 import binascii
 import hashlib
-import io
 import json
 import os
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
-import tarfile
 import tempfile
-import urllib.request
 from pathlib import Path
 
 
 UPTERM_VERSION = "v0.33.0"
-RELEASE_BASE = f"https://github.com/owenthereal/upterm/releases/download/{UPTERM_VERSION}"
-RELEASE_ARCHIVES = {
-    "x86_64": ("upterm_linux_amd64.tar.gz", "17f35ebfd65a77ca2e5df841f0342950d4322cb8752ad7a7adfee8c3854a50f7"),
-    "aarch64": ("upterm_linux_arm64.tar.gz", "a3ade243cd33a3e5518a007ce5ac69d06b01bd988690d2d01d13be9bc61a1f64"),
+BUNDLE_DIR = Path(__file__).resolve().parent / "bin"
+BUNDLED_BINARIES = {
+    "x86_64": ("upterm-linux-amd64", "2223fd2388abe4a72aa38ddbfe4b342c155db8248573ac6bd65b64b054b1609d"),
+    "aarch64": ("upterm-linux-arm64", "590c850ee5229b3fd9fca4657df8afd40d45a02f00c4fb7943ad9148b2b3d997"),
 }
 SERVER = "wss://uptermd.upterm.dev"
 KNOWN_HOSTS = (
@@ -28,22 +26,14 @@ KNOWN_HOSTS = (
     "@cert-authority [uptermd.upterm.dev]:443 ssh-ed25519 "
     "AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4\n"
 )
-MAX_DOWNLOAD_SIZE = 80 * 1024 * 1024
 
 
-def _extract_binary(data):
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        for member in archive.getmembers():
-            if member.isfile() and Path(member.name).name == "upterm":
-                if member.size > MAX_DOWNLOAD_SIZE:
-                    raise ValueError("Upterm executable is too large")
-                source = archive.extractfile(member)
-                if source is None:
-                    break
-                binary = source.read(MAX_DOWNLOAD_SIZE + 1)
-                if binary.startswith(b"\x7fELF"):
-                    return binary
-    raise ValueError("Release archive does not contain a Linux Upterm executable")
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _valid_public_key(line):
@@ -65,7 +55,6 @@ class UptermManager:
         self.home = Path(home or Path.home())
         self.state_dir = self.home / ".agsb"
         self.path = None
-        self.metadata_file = self.state_dir / "upterm_release.json"
         self.session_file = self.state_dir / "upterm_session.json"
         self.known_hosts_file = self.state_dir / "upterm_known_hosts"
         self.connection_command = None
@@ -74,58 +63,47 @@ class UptermManager:
     def prepare(self):
         try:
             configured = os.environ.get("UPTERM_BIN", "").strip()
-            installed = shutil.which("upterm") if not configured else None
-            self.path = Path(configured or installed).expanduser().resolve() if (configured or installed) else self._install_release()
+            self.path = Path(configured).expanduser().resolve() if configured else self._install_bundled_binary()
             if not self.path.is_file() or not os.access(self.path, os.X_OK):
                 raise ValueError(f"Upterm executable is unavailable: {self.path}")
             self._ensure_known_hosts()
             print(f"Upterm: executable ready at {self.path}", flush=True)
             return True
-        except (OSError, ValueError, tarfile.TarError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             print(f"Upterm: setup failed: {type(exc).__name__}: {exc}", flush=True)
             return False
 
-    def _install_release(self):
+    def _install_bundled_binary(self):
         if platform.system().lower() != "linux":
-            raise ValueError("Automatic Upterm installation supports Linux only")
+            raise ValueError("Bundled Upterm executables support Linux only")
         machine = platform.machine().lower()
         architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
-        if architecture not in RELEASE_ARCHIVES:
+        if architecture not in BUNDLED_BINARIES:
             raise ValueError(f"Unsupported Upterm architecture: {machine}")
-        filename, expected_hash = RELEASE_ARCHIVES[architecture]
+        filename, expected_hash = BUNDLED_BINARIES[architecture]
+        source = BUNDLE_DIR / filename
+        if not source.is_file():
+            raise ValueError(f"Bundled Upterm executable is missing: {source}")
+        if _file_sha256(source) != expected_hash:
+            raise ValueError(f"Bundled Upterm executable checksum mismatch: {source}")
         destination = self.home / "upterm"
-        try:
-            metadata = json.loads(self.metadata_file.read_text(encoding="ascii"))
-            if (destination.is_file() and os.access(destination, os.X_OK)
-                    and metadata.get("version") == UPTERM_VERSION
-                    and metadata.get("binary_sha256") == hashlib.sha256(destination.read_bytes()).hexdigest()):
-                print(f"Upterm: using verified cached {UPTERM_VERSION} executable", flush=True)
-                return destination
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-        print(f"Upterm: downloading {UPTERM_VERSION} for linux/{architecture}...", flush=True)
-        request = urllib.request.Request(f"{RELEASE_BASE}/{filename}", headers={"User-Agent": "agsb-streamlit/1.0"})
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = response.read(MAX_DOWNLOAD_SIZE + 1)
-        if len(data) > MAX_DOWNLOAD_SIZE or hashlib.sha256(data).hexdigest() != expected_hash:
-            raise ValueError("Upterm release checksum or size verification failed")
-        binary = _extract_binary(data)
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if (destination.is_file() and not destination.is_symlink()
+                and os.access(destination, os.X_OK) and _file_sha256(destination) == expected_hash):
+            print(f"Upterm: using verified cached {UPTERM_VERSION} executable", flush=True)
+            return destination
+        self.home.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix=".upterm-", dir=destination.parent)
         try:
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(binary)
+            with os.fdopen(descriptor, "wb") as output, source.open("rb") as bundled:
+                shutil.copyfileobj(bundled, output, length=1024 * 1024)
+            if _file_sha256(Path(temporary)) != expected_hash:
+                raise ValueError("Copied Upterm executable checksum mismatch")
             os.chmod(temporary, 0o755)
             os.replace(temporary, destination)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-        self.metadata_file.write_text(json.dumps({
-            "version": UPTERM_VERSION,
-            "binary_sha256": hashlib.sha256(binary).hexdigest(),
-        }), encoding="ascii")
-        print("Upterm: release SHA-256 verified", flush=True)
+        print(f"Upterm: copied bundled {UPTERM_VERSION} linux/{architecture} to {destination}", flush=True)
         return destination
 
     def _ensure_known_hosts(self):
@@ -208,8 +186,23 @@ class UptermManager:
                 or "\n" in command or "\r" in command):
             print(f"Upterm: unexpected session status: {session.get('status')}", flush=True)
             return False
-        self.connection_command = command
-        print(f"Upterm SSH connection: {command}", flush=True)
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            arguments = []
+        if (len(arguments) == 2 and arguments[0] == "ssh"):
+            expected_host = "uptermd.upterm.dev"
+        elif (len(arguments) == 4 and arguments[:2] == ["ssh", "-o"]
+              and arguments[2].startswith("ProxyCommand=upterm proxy wss://")):
+            expected_host = "uptermd.upterm.dev:443"
+        else:
+            expected_host = None
+        user, separator, host = arguments[-1].rpartition("@") if arguments else ("", "", "")
+        if not separator or not user or host != expected_host:
+            print("Upterm: cannot derive direct SSH command from session data", flush=True)
+            return False
+        self.connection_command = f"ssh {shlex.quote(user + '@uptermd.upterm.dev')}"
+        print(f"Upterm SSH connection: {self.connection_command}", flush=True)
         return True
 
     def start(self):

@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--uuid", "-u", help="设置自定义UUID")
     parser.add_argument("--port", "-p", dest="vmpt", type=int, help="设置自定义Vmess端口")
     parser.add_argument("--agk", "--token", dest="agk", help="设置 Argo Tunnel Token (用于Cloudflare Zero Trust命名隧道)")
-    parser.add_argument("--ssh-file", dest="ssh_file", help="通过同一隧道公开的 UUID tmate 文件")
+    parser.add_argument("--ssh-file", dest="ssh_file", help="通过同一隧道公开的 SSH 会话文件")
     parser.add_argument("--public-port", dest="public_port", type=int, help="Cloudflare origin/gateway 端口")
     parser.add_argument("--no-autostart", action="store_true", help="跳过 crontab 自启动配置")
 
@@ -551,7 +551,7 @@ def install(args):
         if ssh_file:
             config_data["ssh_file_url"] = f"https://{final_domain}/{Path(ssh_file).name}"
             CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
-            print(f"tmate 预期文件地址: {config_data['ssh_file_url']}")
+            print(f"SSH 会话文件预期地址: {config_data['ssh_file_url']}")
         generate_links(final_domain, public_port, uuid_str)
     else: # This case should ideally not be reached if logic above is correct
         print("\033[31m最终域名未能确定，无法生成链接。\033[0m")
@@ -814,7 +814,7 @@ def create_gateway_script(public_port, singbox_port, ssh_file):
             try:
                 body = FILE_PATH.read_bytes()
             except OSError:
-                body = b"tmate session file is not ready\\n"
+                body = b"SSH session file is not ready\\n"
                 status = b"503 Service Unavailable"
             else:
                 status = b"200 OK"

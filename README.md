@@ -453,7 +453,7 @@ export DOMAIN="your.domain.example"
 
 默认启动的 Upterm 会话允许任何持有日志中 SSH 连接命令的人进入可写 shell。可选用 `UPTERM_AUTHORIZED_USER=github:your-username`、`UPTERM_AUTHORIZED_KEY`（一行 SSH 公钥）或 `UPTERM_AUTHORIZED_KEYS`（每行一个原始 SSH 公钥的文件路径）限制连接者。请限制 Streamlit 应用日志的访问权限。`UUID` 仅用于 sing-box，Upterm 不使用它。
 
-首次启动从 [Upterm 官方仓库](https://github.com/owenthereal/upterm)下载固定的 v0.33.0 Linux 发布包并校验 SHA-256；也可用 `UPTERM_BIN` 指向预装的可执行文件。Upterm 使用 `wss://uptermd.upterm.dev` 的 443 端口，并固定官方中继主机密钥，不需要在容器内运行 `sshd`。日志中的连接命令可能包含 `upterm proxy`，这种情况下连接端也需要安装 Upterm。Streamlit 重跑时会查询并重用已有会话；授权配置改变时会停止旧会话并建立新会话。
+仓库自带 [Upterm 官方 v0.33.0](https://github.com/owenthereal/upterm/releases/tag/v0.33.0) 的 Linux x86_64 和 arm64 可执行文件，位于 `bin/`，许可证见 `bin/UPTERM-LICENSE`。启动时校验 SHA-256 并复制到 `~/upterm`，不再从网络下载；也可用 `UPTERM_BIN` 指向预装的可执行文件。容器通过 `wss://uptermd.upterm.dev` 的 443 端口连接中继，并固定官方中继主机密钥，不需要在容器内运行 `sshd`。日志直接输出 `ssh 用户名@uptermd.upterm.dev`，连接端只需 SSH 客户端且须能访问中继的 TCP 22 端口。Streamlit 重跑时会查询并重用已有会话；授权配置改变时会停止旧会话并建立新会话。
 
 Cloudflare 隧道仍使用 `AGK`。`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或 19999 端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`。隧道 token 仅连接已有隧道，不会自动创建 Public Hostname 路由。Streamlit 启动不修改 crontab。
 
