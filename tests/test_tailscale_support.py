@@ -61,6 +61,9 @@ class TailscaleTests(unittest.TestCase):
             self.assertFalse(config["endpoints"][0]["system_interface"])
             self.assertNotIn(KEY, json.dumps(config))
             self.assertEqual((Path(directory) / "tailscale").stat().st_mode & 0o777, 0o700)
+            taildrop = Path(config["endpoints"][0]["taildrop_directory"])
+            self.assertEqual(taildrop, Path(directory) / "tailscale" / "taildrop")
+            self.assertEqual(taildrop.stat().st_mode & 0o777, 0o700)
             runtime = json.loads(tailscale.runtime_config(config, {"TAILSCALE_AUTH_KEY": KEY}))
             self.assertEqual(runtime["endpoints"][0]["auth_key"], KEY)
             self.assertNotIn("auth_key", config["endpoints"][0])
@@ -72,13 +75,16 @@ class TailscaleTests(unittest.TestCase):
         binary = Path("/tmp/test-sing-box")
         version = subprocess.CompletedProcess([], 0, "sing-box version 1.14.3\nTags: with_tailscale\n", "")
         checked = subprocess.CompletedProcess([], 1, "", "invalid auth " + KEY)
-        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True):
+        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY, "SUDO_UID": "12345", "SUDO_GID": "12345", "SUDO_USER": "other-user"}, clear=True):
             with patch.object(tailscale.subprocess, "run", side_effect=[version, checked]) as run:
                 with self.assertRaises(RuntimeError) as error:
                     tailscale.validate_config(binary, config)
                 self.assertNotIn(KEY, str(error.exception))
                 self.assertEqual(json.loads(run.call_args.kwargs["input"])["endpoints"][0]["auth_key"], KEY)
                 self.assertNotIn(KEY, str(run.call_args.args))
+                for call in run.call_args_list:
+                    for name in ("TAILSCALE_AUTH_KEY", "SUDO_UID", "SUDO_GID", "SUDO_USER"):
+                        self.assertNotIn(name, call.kwargs["env"])
         for output in ("sing-box version 1.13.0\nTags: with_tailscale", "sing-box version 1.14.3\nTags: with_gvisor"):
             with patch.object(tailscale.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
                 with self.assertRaises(RuntimeError):
@@ -101,6 +107,8 @@ class TailscaleTests(unittest.TestCase):
             tailscale.add_endpoint(config, settings, state)
             template = json.dumps(config)
             (state / "sb.json").write_text(template)
+            # Reproduce directories missing at startup after config generation.
+            shutil.rmtree(state / "tailscale")
             installer.CONFIG_FILE.write_text(json.dumps({"port_vm_ws": 19999, "tailscale": settings}))
             installer.create_startup_script()
             script = (state / "start_sb.sh").read_text()
@@ -108,10 +116,11 @@ class TailscaleTests(unittest.TestCase):
             self.assertEqual(subprocess.run(["bash", "-n", str(state / "start_sb.sh")]).returncode, 0)
             # A substitute executable reports its input and PID, without a tailnet login.
             binary = state / "sing-box"
-            binary.write_text(f"#!{sys.executable}\nimport os,sys,json\nprint(json.dumps({{'pid':os.getpid(),'args':sys.argv[1:],'key_env':os.getenv('TAILSCALE_AUTH_KEY'),'config':json.load(sys.stdin)}}))\n")
+            binary.write_text(f"#!{sys.executable}\nimport os,sys,json\nprint(json.dumps({{'pid':os.getpid(),'args':sys.argv[1:],'key_env':os.getenv('TAILSCALE_AUTH_KEY'),'sudo_env':{{name:os.getenv(name) for name in ['SUDO_UID','SUDO_GID','SUDO_USER','SUDO_COMMAND']}},'config':json.load(sys.stdin)}}))\n")
             binary.chmod(0o755)
             env = os.environ.copy()
             env["TAILSCALE_AUTH_KEY"] = KEY
+            env.update(SUDO_UID="12345", SUDO_GID="12345", SUDO_USER="other-user", SUDO_COMMAND="bootstrap")
             process = subprocess.Popen(
                 [sys.executable, str(state / "tailscale_support.py"), directory],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
@@ -122,10 +131,32 @@ class TailscaleTests(unittest.TestCase):
             self.assertEqual(reported["pid"], process.pid)
             self.assertEqual(reported["args"], ["run", "-c", "stdin"])
             self.assertIsNone(reported["key_env"])
+            self.assertTrue(all(value is None for value in reported["sudo_env"].values()))
             self.assertEqual(reported["config"]["endpoints"][0]["auth_key"], KEY)
+            for name in ("state_directory", "taildrop_directory"):
+                path = Path(reported["config"]["endpoints"][0][name])
+                self.assertTrue(path.is_dir())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
             self.assertEqual((state / "sb.json").read_text(), template)
             self.assertIn("Tailscale SSH connection: ssh", stdout)
             self.assertNotIn(KEY, "\n".join(stdout.splitlines()[:-1]))
+
+    def test_legacy_config_prepares_taildrop_without_changing_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            node_dir = state / "tailscale"
+            node_dir.mkdir()
+            identity = node_dir / "tailscaled.state"
+            identity.write_text("existing-node-identity")
+            endpoint = {"tag": tailscale.TAILSCALE_TAG, "state_directory": str(node_dir)}
+            with patch.object(tailscale.os, "chown", side_effect=PermissionError("operation not permitted")) as chown:
+                tailscale.prepare_endpoint_directories(endpoint, state)
+                # The same paths are safe to reuse on every application restart.
+                tailscale.prepare_endpoint_directories(endpoint, state)
+                chown.assert_not_called()
+            self.assertEqual(identity.read_text(), "existing-node-identity")
+            self.assertEqual(Path(endpoint["taildrop_directory"]), node_dir / "taildrop")
+            self.assertEqual((node_dir / "taildrop").stat().st_mode & 0o777, 0o700)
 
     def test_running_proxy_is_reconfigured_for_enable_change_and_disable(self):
         launcher = load_script("launcher_tailscale", "upload-yuancheng.py")

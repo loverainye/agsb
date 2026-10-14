@@ -38,21 +38,35 @@ def settings_from_env(uuid_value, environ=None):
     }
 
 
+def prepare_endpoint_directories(endpoint, install_dir):
+    """Create directories as the app user before sing-box's mkdir/chown path."""
+    install_dir = Path(install_dir).resolve()
+    state_dir = Path(endpoint.get("state_directory") or "tailscale")
+    if not state_dir.is_absolute():
+        state_dir = install_dir / state_dir
+    taildrop_dir = Path(endpoint.get("taildrop_directory") or state_dir / "taildrop")
+    if not taildrop_dir.is_absolute():
+        taildrop_dir = install_dir / taildrop_dir
+    for directory in (state_dir, taildrop_dir):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    endpoint["state_directory"] = str(state_dir.resolve())
+    endpoint["taildrop_directory"] = str(taildrop_dir.resolve())
+
+
 def add_endpoint(config, settings, install_dir):
     if settings is None:
         return
-    state_dir = Path(install_dir) / "tailscale"
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    state_dir.chmod(0o700)
-    config["endpoints"] = [{
+    endpoint = {
         "type": "tailscale",
         "tag": TAILSCALE_TAG,
         "hostname": settings["hostname"],
-        "state_directory": str(state_dir.resolve()),
         "ephemeral": settings["ephemeral"],
         "system_interface": False,
         "ssh_server": True,
-    }]
+    }
+    prepare_endpoint_directories(endpoint, install_dir)
+    config["endpoints"] = [endpoint]
     # The endpoint resolves control-plane/DERP hosts with the container DNS.
     config["dns"] = {"servers": [{"type": "local", "tag": "local-dns"}], "final": "local-dns"}
     config["route"] = {
@@ -87,8 +101,18 @@ def redact(message):
     return re.sub(r"tskey-[A-Za-z0-9_-]+", "[redacted]", message)
 
 
+def singbox_environment():
+    environment = os.environ.copy()
+    # sing-box's CLI uses SUDO_* to select a file owner. Streamlit can inherit
+    # these from its bootstrap while running as a different, unprivileged user.
+    for name in ("TAILSCALE_AUTH_KEY", "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND"):
+        environment.pop(name, None)
+    return environment
+
+
 def validate_config(binary, config):
-    version = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15)
+    child_env = singbox_environment()
+    version = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15, env=child_env)
     match = re.search(r"sing-box version (\d+)\.(\d+)\.(\d+)([^\s]*)", version.stdout)
     if version.returncode or not match or tuple(map(int, match.group(1, 2, 3))) < (1, 14, 0):
         raise RuntimeError("Tailscale SSH requires sing-box >= 1.14.0")
@@ -96,7 +120,7 @@ def validate_config(binary, config):
         raise RuntimeError("sing-box was built without with_tailscale; Tailscale SSH is unavailable")
     checked = subprocess.run(
         [str(binary), "check", "-c", "stdin"], input=runtime_config(config),
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, timeout=20, env=child_env,
     )
     if checked.returncode:
         raise RuntimeError("Tailscale sing-box configuration check failed: " + redact(checked.stderr or checked.stdout))
@@ -107,6 +131,10 @@ def run_singbox(install_dir):
     """Replace this short-lived launcher with sing-box, retaining its PID."""
     install_dir = Path(install_dir).resolve()
     config = json.loads((install_dir / "sb.json").read_text())
+    for endpoint in config.get("endpoints", []):
+        if endpoint.get("tag") == TAILSCALE_TAG:
+            prepare_endpoint_directories(endpoint, install_dir)
+            print("Tailscale: state and Taildrop directories prepared by the app user (0700)", flush=True)
     payload = runtime_config(config).encode()
     for endpoint in config.get("endpoints", []):
         if endpoint.get("tag") == TAILSCALE_TAG:
@@ -115,8 +143,9 @@ def run_singbox(install_dir):
             print(f"Tailscale: starting SSH in the existing sing-box process; user={username}", flush=True)
             print(f"Tailscale SSH connection: {command}", flush=True)
             print("Tailscale: connect after the node is online; the client must join the tailnet and SSH policy must allow this user", flush=True)
-    child_env = os.environ.copy()
-    child_env.pop("TAILSCALE_AUTH_KEY", None)
+    child_env = singbox_environment()
+    if any(name in os.environ for name in ("SUDO_USER", "SUDO_UID", "SUDO_GID")):
+        print("Tailscale: inherited sudo ownership metadata removed; files belong to the current app user", flush=True)
     # An anonymous file avoids both a persistent credential file and pipe limits.
     if hasattr(os, "memfd_create"):
         stream = os.fdopen(os.memfd_create("sing-box-config", os.MFD_CLOEXEC), "w+b")

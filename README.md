@@ -473,6 +473,8 @@ Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-bo
 
 Streamlit 应用日志会显示 `Tailscale:` 启动信息、`endpoint/tailscale[tailscale-ssh]` 注册诊断，以及 `Tailscale SSH connection: ssh appuser@streamlit-agsb`。用户名从当前运行用户获取；此命令输出时节点可能仍在注册，先在 Tailscale 控制台确认节点在线。详细原始日志位于 `~/.agsb/sb.log`。日志持续转发由一个后台线程完成，不增加服务进程。
 
+启动前由应用用户创建 `~/.agsb/tailscale/` 和其中的 `taildrop/`，权限均为 `0700`，并显式指定 `taildrop_directory`。同时清除 sing-box 子进程继承的 `SUDO_USER`、`SUDO_UID`、`SUDO_GID` 等变量，让目录和 SSH 主机密钥归属当前应用用户，避免 Streamlit 容器因 `chown: operation not permitted` 退出。
+
 连接电脑先登录同一个 tailnet，启用 MagicDNS，并在 Tailscale 策略中允许到该节点的 TCP 22 和 SSH 登录到日志中的用户（Streamlit 通常为 `appuser`）。然后直接执行日志中的 `ssh ...` 命令。若 Auth Key 带设备标签，SSH 策略的 `dst` 应使用对应标签；默认的 `autogroup:self` 规则可能不适用于标签节点。实际节点名出现重名后缀时，以控制台中的 MagicDNS 名称或 Tailscale IP 为准。详见 [Tailscale SSH 策略](https://tailscale.com/kb/1193/tailscale-ssh) 和 [sing-box Tailscale endpoint](https://sing-box.sagernet.org/zh/configuration/endpoint/tailscale/)。
 
 ## 🌐 Glitch 网站保活脚本
