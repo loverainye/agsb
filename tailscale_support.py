@@ -1,4 +1,4 @@
-"""Tailscale SSH support for the existing sing-box process."""
+"""Cloudflare Tunnel and Tailscale SSH in the existing sing-box process."""
 
 import hashlib
 import json
@@ -14,9 +14,38 @@ from pathlib import Path
 
 
 TAILSCALE_TAG = "tailscale-ssh"
+CLOUDFLARE_TAG = "cloudflare-tunnel"
 _RELAYS = {}
 _RELAY_LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def cloudflare_settings(token):
+    token = token.strip()
+    if not token:
+        raise ValueError("AGK is required for the embedded Cloudflare Tunnel")
+    return {"token_hash": hashlib.sha256(token.encode()).hexdigest()}
+
+
+def _add_local_resolver(config):
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+    if not any(server.get("tag") == "local-dns" for server in servers):
+        servers.append({"type": "local", "tag": "local-dns"})
+    dns.setdefault("final", "local-dns")
+    route = config.setdefault("route", {})
+    route.setdefault("default_domain_resolver", "local-dns")
+    route.setdefault("final", "direct")
+
+
+def add_cloudflare(config):
+    # The remote tunnel config still selects DOMAIN -> http://localhost:PORT.
+    # Empty protocol/edge options use automatic protocol and address selection.
+    config.setdefault("inbounds", []).append({"type": "cloudflared", "tag": CLOUDFLARE_TAG})
+    _add_local_resolver(config)
+    config["route"].setdefault("rules", []).append({
+        "inbound": [CLOUDFLARE_TAG], "action": "route", "outbound": "direct",
+    })
 
 
 def settings_from_env(uuid_value, environ=None):
@@ -66,15 +95,11 @@ def add_endpoint(config, settings, install_dir):
         "ssh_server": True,
     }
     prepare_endpoint_directories(endpoint, install_dir)
-    config["endpoints"] = [endpoint]
+    config.setdefault("endpoints", []).append(endpoint)
     # The endpoint resolves control-plane/DERP hosts with the container DNS.
-    config["dns"] = {"servers": [{"type": "local", "tag": "local-dns"}], "final": "local-dns"}
-    config["route"] = {
-        "default_domain_resolver": "local-dns",
-        "final": "direct",
-        # SSH is intercepted inside the endpoint, before sing-box routing.
-        "rules": [{"inbound": [TAILSCALE_TAG], "action": "reject"}],
-    }
+    _add_local_resolver(config)
+    # SSH is intercepted inside the endpoint, before sing-box routing.
+    config["route"].setdefault("rules", []).append({"inbound": [TAILSCALE_TAG], "action": "reject"})
     # tsnet's authentication and state diagnostics are emitted at debug level.
     config["log"]["level"] = "debug"
 
@@ -83,6 +108,12 @@ def runtime_config(config, environ=None):
     """Copy the template and inject credentials only into the runtime JSON."""
     env = os.environ if environ is None else environ
     result = json.loads(json.dumps(config))
+    for inbound in result.get("inbounds", []):
+        if inbound.get("tag") == CLOUDFLARE_TAG:
+            token = (env.get("AGK", "").strip() or env.get("agk", "").strip())
+            if not token:
+                raise ValueError("AGK is required to start the configured Cloudflare Tunnel")
+            inbound["token"] = token
     for endpoint in result.get("endpoints", []):
         if endpoint.get("tag") == TAILSCALE_TAG:
             key = env.get("TAILSCALE_AUTH_KEY", "").strip()
@@ -92,8 +123,12 @@ def runtime_config(config, environ=None):
     return json.dumps(result)
 
 
-def redact(message):
+def redact(message, secrets=()):
     message = _ANSI.sub("", str(message))
+    for secret in secrets:
+        secret = secret.strip()
+        if secret:
+            message = message.replace(secret, "[redacted]")
     for name in ("TAILSCALE_AUTH_KEY", "AGK", "agk"):
         secret = os.environ.get(name, "").strip()
         if secret:
@@ -105,26 +140,34 @@ def singbox_environment():
     environment = os.environ.copy()
     # sing-box's CLI uses SUDO_* to select a file owner. Streamlit can inherit
     # these from its bootstrap while running as a different, unprivileged user.
-    for name in ("TAILSCALE_AUTH_KEY", "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND"):
+    for name in ("AGK", "agk", "TAILSCALE_AUTH_KEY", "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND"):
         environment.pop(name, None)
     return environment
 
 
 def validate_config(binary, config):
+    features = []
+    if any(item.get("tag") == CLOUDFLARE_TAG for item in config.get("inbounds", [])):
+        features.append(("Cloudflare", "with_cloudflared"))
+    if any(item.get("tag") == TAILSCALE_TAG for item in config.get("endpoints", [])):
+        features.append(("Tailscale", "with_tailscale"))
     child_env = singbox_environment()
     version = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15, env=child_env)
     match = re.search(r"sing-box version (\d+)\.(\d+)\.(\d+)([^\s]*)", version.stdout)
     if version.returncode or not match or tuple(map(int, match.group(1, 2, 3))) < (1, 14, 0):
-        raise RuntimeError("Tailscale SSH requires sing-box >= 1.14.0")
-    if "with_tailscale" not in version.stdout:
-        raise RuntimeError("sing-box was built without with_tailscale; Tailscale SSH is unavailable")
+        raise RuntimeError("Cloudflare Tunnel / Tailscale SSH requires sing-box >= 1.14.0")
+    tags = set(re.findall(r"with_[a-z0-9_]+", version.stdout))
+    for feature, tag in features:
+        if tag not in tags:
+            raise RuntimeError(f"sing-box was built without {tag}; {feature} is unavailable")
     checked = subprocess.run(
         [str(binary), "check", "-c", "stdin"], input=runtime_config(config),
         capture_output=True, text=True, timeout=20, env=child_env,
     )
     if checked.returncode:
-        raise RuntimeError("Tailscale sing-box configuration check failed: " + redact(checked.stderr or checked.stdout))
-    print(f"Tailscale: sing-box {match.group(0).split()[-1]} configuration check passed", flush=True)
+        raise RuntimeError("sing-box configuration check failed: " + redact(checked.stderr or checked.stdout))
+    for feature, _ in features:
+        print(f"{feature}: sing-box {match.group(0).split()[-1]} configuration check passed", flush=True)
 
 
 def run_singbox(install_dir):
@@ -136,6 +179,9 @@ def run_singbox(install_dir):
             prepare_endpoint_directories(endpoint, install_dir)
             print("Tailscale: state and Taildrop directories prepared by the app user (0700)", flush=True)
     payload = runtime_config(config).encode()
+    if any(item.get("tag") == CLOUDFLARE_TAG for item in config.get("inbounds", [])):
+        print("Cloudflare: starting Tunnel in the existing sing-box process; token injected from AGK", flush=True)
+        print("Cloudflare: connection and ingress diagnostics are in sb.log; startup does not yet confirm edge registration", flush=True)
     for endpoint in config.get("endpoints", []):
         if endpoint.get("tag") == TAILSCALE_TAG:
             username = pwd.getpwuid(os.getuid()).pw_name
@@ -145,7 +191,7 @@ def run_singbox(install_dir):
             print("Tailscale: connect after the node is online; the client must join the tailnet and SSH policy must allow this user", flush=True)
     child_env = singbox_environment()
     if any(name in os.environ for name in ("SUDO_USER", "SUDO_UID", "SUDO_GID")):
-        print("Tailscale: inherited sudo ownership metadata removed; files belong to the current app user", flush=True)
+        print("sing-box: inherited sudo ownership metadata removed; files belong to the current app user", flush=True)
     # An anonymous file avoids both a persistent credential file and pipe limits.
     if hasattr(os, "memfd_create"):
         stream = os.fdopen(os.memfd_create("sing-box-config", os.MFD_CLOEXEC), "w+b")
@@ -160,8 +206,9 @@ def run_singbox(install_dir):
 
 
 class _LogRelay:
-    def __init__(self, state_dir, installer_log):
+    def __init__(self, state_dir, installer_log, secrets=()):
         self.state_dir = state_dir
+        self.secrets = tuple(secrets)
         self.paths = (installer_log, state_dir / "sb.log")
         self.positions = {}
         self.pending = {}
@@ -200,11 +247,16 @@ class _LogRelay:
                 lines = content.split(b"\n")
                 self.pending[path] = lines.pop()
                 for line in lines:
-                    message = redact(line.decode("utf-8", errors="replace"))
+                    message = redact(line.decode("utf-8", errors="replace"), self.secrets)
                     if ("Tailscale" in message or "endpoint/tailscale[" in message
-                            or "FATAL" in message or "RuntimeError:" in message):
+                            or "Cloudflare:" in message or "inbound/cloudflared[" in message
+                            or "FATAL" in message or "Traceback" in message
+                            or "Error:" in message or "失败" in message or "错误" in message):
                         # Routine network dial messages would overwhelm app logs.
-                        if "output connection to" not in message and "output packet connection" not in message:
+                        if not any(text in message for text in (
+                            "output connection to", "output packet connection",
+                            "inbound connection to", "inbound packet connection to",
+                        )):
                             print(message, flush=True)
             except OSError:
                 continue
@@ -214,17 +266,19 @@ class _LogRelay:
             self.poll()
 
 
-def start_log_relay(state_dir, installer_log):
+def start_log_relay(state_dir, installer_log, secrets=()):
     """One daemon thread per app, reused across Streamlit reruns."""
     state_dir, installer_log = Path(state_dir), Path(installer_log)
     with _RELAY_LOCK:
         key = str(state_dir.resolve())
         relay = _RELAYS.get(key)
         if relay is None:
-            relay = _LogRelay(state_dir, installer_log)
-            threading.Thread(target=relay.run, name="tailscale-log-relay", daemon=True).start()
+            relay = _LogRelay(state_dir, installer_log, secrets=secrets)
+            threading.Thread(target=relay.run, name="singbox-log-relay", daemon=True).start()
             _RELAYS[key] = relay
-        elif relay.paths[0] != installer_log:
+        else:
+            relay.secrets = tuple(dict.fromkeys((*relay.secrets, *secrets)))
+        if relay.paths[0] != installer_log:
             # UUID changes select a new installer log in the same app directory.
             try:
                 stat = installer_log.stat()
@@ -239,5 +293,5 @@ if __name__ == "__main__":
     try:
         run_singbox(sys.argv[1])
     except Exception as exc:
-        print(f"Tailscale: sing-box startup failed: {redact(exc)}", flush=True)
+        print(f"RuntimeError: sing-box startup failed: {redact(exc)}", flush=True)
         sys.exit(1)

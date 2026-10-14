@@ -11,7 +11,7 @@ import re
 import uuid as uuid_module
 from pathlib import Path
 from upterm_manager import UptermManager
-from tailscale_support import settings_from_env, start_log_relay
+from tailscale_support import cloudflare_settings, settings_from_env, start_log_relay
 
 # 配置
 USER_HOME = Path.home()
@@ -92,6 +92,8 @@ def resolve_settings(args):
 
 
 def _is_running(pid):
+    if pid <= 0 or not Path(f"/proc/{pid}/exe").exists():
+        return False
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
@@ -104,7 +106,9 @@ def _installer_already_started(settings):
     port = str(settings["port"])
     marker = USER_HOME / ".agsb" / f"launcher-{uuid_value}.pid"
     tailscale = settings_from_env(uuid_value)
-    signature_file = marker.with_suffix(".tailscale.json")
+    cloudflare = cloudflare_settings(settings["agk"])
+    signature_file = marker.with_suffix(".runtime.json")
+    signature = {"tailscale": tailscale, "cloudflare": cloudflare, "domain": settings["domain"]}
     try:
         if marker.exists():
             pid = int(marker.read_text().strip())
@@ -112,9 +116,10 @@ def _installer_already_started(settings):
             if (any(b"agsb-v2.py" in item for item in arguments)
                     and uuid_value.encode() in arguments
                     and b"--ssh-file" not in arguments
+                    and b"--embedded-cloudflare" in arguments
                     and b"--port" in arguments
                     and arguments[arguments.index(b"--port") + 1] == port.encode()
-                    and (json.loads(signature_file.read_text()) if signature_file.exists() else None) == tailscale):
+                    and json.loads(signature_file.read_text()) == signature):
                 return True
     except (OSError, ValueError, IndexError):
         pass
@@ -125,11 +130,12 @@ def _installer_already_started(settings):
                 or config.get("ssh_file")
                 or int(config.get("port_vm_ws", 0)) != int(port)
                 or config.get("custom_domain_agn") != settings["domain"]
+                or config.get("cloudflare") != cloudflare
                 or config.get("tailscale") != tailscale):
             return False
         return all(
             _is_running(int((config_file.parent / name).read_text().strip()))
-            for name in ("sbpid.log", "sbargopid.log")
+            for name in ("sbpid.log",)
         )
     except (OSError, ValueError, KeyError):
         return False
@@ -141,8 +147,10 @@ def launch_installer(settings):
     state_dir = USER_HOME / ".agsb"
     log_path = state_dir / f"launcher-{uuid_value}.log"
     tailscale = settings_from_env(uuid_value)
+    cloudflare = cloudflare_settings(settings["agk"])
+    start_log_relay(state_dir, log_path, secrets=(settings["agk"],))
+    print(f"Cloudflare: enabled in sing-box; DOMAIN={settings['domain']}, origin=http://localhost:{settings['port']}; diagnostics will appear in app logs", flush=True)
     if tailscale:
-        start_log_relay(state_dir, log_path)
         print(f"Tailscale: enabled; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}; diagnostics will appear in app logs", flush=True)
     if _installer_already_started(settings):
         print(f"ArgoSB 安装流程已在后台运行，UUID={uuid_value}")
@@ -160,6 +168,7 @@ def launch_installer(settings):
         "install", "--uuid", uuid_value,
         "--port", str(settings["port"]),
         "--no-autostart",
+        "--embedded-cloudflare",
     ]
     if settings["domain"]:
         arguments.extend(["--domain", str(settings["domain"])])
@@ -169,8 +178,7 @@ def launch_installer(settings):
         raise FileNotFoundError(f"安装脚本不存在: {local_script}")
     child_env = os.environ.copy()
     child_env["PYTHONUNBUFFERED"] = "1"
-    if settings["agk"]:
-        child_env["AGK"] = str(settings["agk"])
+    child_env["AGK"] = str(settings["agk"])
     command = [sys.executable, str(local_script), *arguments]
     with log_path.open("ab") as log_stream:
         process = subprocess.Popen(
@@ -178,7 +186,9 @@ def launch_installer(settings):
             start_new_session=True, env=child_env
         )
     marker.write_text(str(process.pid), encoding="ascii")
-    marker.with_suffix(".tailscale.json").write_text(json.dumps(tailscale), encoding="utf-8")
+    marker.with_suffix(".runtime.json").write_text(json.dumps({
+        "tailscale": tailscale, "cloudflare": cloudflare, "domain": settings["domain"],
+    }), encoding="utf-8")
     print(f"ArgoSB 已在后台启动，日志: {log_path}", flush=True)
     return process
 

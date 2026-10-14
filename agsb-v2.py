@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--ssh-file", dest="ssh_file", help="通过同一隧道公开的 SSH 会话文件")
     parser.add_argument("--public-port", dest="public_port", type=int, help="Cloudflare origin/gateway 端口")
     parser.add_argument("--no-autostart", action="store_true", help="跳过 crontab 自启动配置")
+    parser.add_argument("--embedded-cloudflare", action="store_true", help="使用 sing-box 内置 Cloudflare 命名隧道（需要 AGK 和 sing-box >= 1.14）")
 
     return parser.parse_args()
 
@@ -327,6 +328,7 @@ def generate_links(domain, port_vm_ws, uuid_str):
 
 # 安装过程
 def install(args):
+    embedded_cloudflare = args.embedded_cloudflare
     if not INSTALL_DIR.exists():
         INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     os.chdir(INSTALL_DIR)
@@ -362,11 +364,13 @@ def install(args):
 
     # Argo Tunnel Token (agk)
     argo_token = args.agk or os.environ.get("AGK") or os.environ.get("agk")
+    if embedded_cloudflare and not (argo_token and argo_token.strip()):
+        raise ValueError("AGK is required for --embedded-cloudflare; Quick Tunnel uses standalone cloudflared")
     if not argo_token:
         argo_token_input = input("请输入 Argo Tunnel Token (AGK) (例如: eyJhIjo...Ifs9, 若使用Cloudflare Zero Trust隧道请输入, 留空则使用临时隧道): ").strip()
         argo_token = argo_token_input or None # None if empty
     if argo_token:
-        print(f"使用 Argo Tunnel Token: ******{argo_token[-6:]}") # 仅显示末尾几位
+        print("使用 Argo Tunnel Token: [redacted]")
         write_debug_log(f"Argo Token: Present (not logged for security)")
     else:
         print("未提供 Argo Tunnel Token，将使用临时隧道 (Quick Tunnel)。")
@@ -440,14 +444,15 @@ def install(args):
 
     # sing-box
     singbox_path = INSTALL_DIR / "sing-box"
+    fallback_version = "1.14.3" if embedded_cloudflare or os.environ.get("TAILSCALE_AUTH_KEY", "").strip() else "1.9.0-beta.11"
     if not singbox_path.exists():
         try:
             print("获取sing-box最新版本号...")
             version_info = http_get("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
-            sb_version = json.loads(version_info)["tag_name"].lstrip("v") if version_info else "1.9.0-beta.11" # Fallback
+            sb_version = json.loads(version_info)["tag_name"].lstrip("v") if version_info else fallback_version
             print(f"sing-box 最新版本: {sb_version}")
         except Exception as e:
-            sb_version = "1.9.0-beta.11" # Fallback
+            sb_version = fallback_version
             print(f"获取最新版本失败，使用默认版本: {sb_version}，错误: {e}")
         
         sb_name = f"sing-box-{sb_version}-linux-{arch}"
@@ -488,7 +493,7 @@ def install(args):
 
     # cloudflared
     cloudflared_path = INSTALL_DIR / "cloudflared"
-    if not cloudflared_path.exists():
+    if not embedded_cloudflare and not cloudflared_path.exists():
         cf_arch = arch
         if arch == "armv7": cf_arch = "arm" # cloudflared uses 'arm' for 32-bit arm
         
@@ -501,13 +506,20 @@ def install(args):
                 sys.exit(1)
 
     # --- 配置和启动 ---
+    cloudflare = None
+    if embedded_cloudflare:
+        from tailscale_support import cloudflare_settings
+        cloudflare = cloudflare_settings(argo_token)
+        # CLI --agk and lowercase agk also feed the anonymous runtime config.
+        os.environ["AGK"] = argo_token.strip()
+        print(f"Cloudflare: enabling Tunnel in the existing sing-box; origin=http://localhost:{public_port}", flush=True)
     tailscale = None
     if os.environ.get("TAILSCALE_AUTH_KEY", "").strip():
         from tailscale_support import settings_from_env
         tailscale = settings_from_env(uuid_str)
         print(f"Tailscale: enabling SSH in the existing sing-box; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}", flush=True)
     # Validate before replacing configuration or stopping an existing service.
-    create_sing_box_config(singbox_port, uuid_str, tailscale=tailscale)
+    create_sing_box_config(singbox_port, uuid_str, tailscale=tailscale, cloudflare=cloudflare)
     config_data = {
         "uuid_str": uuid_str,
         "port_vm_ws": public_port,
@@ -520,13 +532,14 @@ def install(args):
         ),
         "argo_token": None,
         "tunnel_token_present": bool(argo_token),
+        "cloudflare": cloudflare,
         "tailscale": tailscale,
         "custom_domain_agn": custom_domain, # Will be None if not provided
         "install_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config_data, f, indent=2)
-    if argo_token:
+    if argo_token and not embedded_cloudflare:
         token_fd = os.open(TUNNEL_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(token_fd, "w", encoding="utf-8") as token_stream:
             token_stream.write(argo_token)
@@ -584,7 +597,8 @@ def setup_autostart():
         filtered_lines.append(f"@reboot {script_name_sb} >/dev/null 2>&1")
         if (INSTALL_DIR / "start_gateway.sh").exists():
             filtered_lines.append(f"@reboot {script_name_gateway} >/dev/null 2>&1")
-        filtered_lines.append(f"@reboot {script_name_cf} >/dev/null 2>&1")
+        if (INSTALL_DIR / "start_cf.sh").exists():
+            filtered_lines.append(f"@reboot {script_name_cf} >/dev/null 2>&1")
         
         new_crontab = "\n".join(filtered_lines).strip() + "\n"
         
@@ -688,16 +702,19 @@ def upgrade():
 
 # 检查脚本运行状态
 def check_status():
-    sb_running = SB_PID_FILE.exists() and os.path.exists(f"/proc/{SB_PID_FILE.read_text().strip()}")
-    cf_running = ARGO_PID_FILE.exists() and os.path.exists(f"/proc/{ARGO_PID_FILE.read_text().strip()}")
+    sb_running = process_running(SB_PID_FILE)
+    cf_running = process_running(ARGO_PID_FILE)
+    embedded_cloudflare = False
     gateway_required = False
     gateway_running = True
     if CONFIG_FILE.exists():
         try:
-            gateway_required = bool(json.loads(CONFIG_FILE.read_text()).get("ssh_file"))
-            gateway_running = GATEWAY_PID_FILE.exists() and os.path.exists(
-                f"/proc/{GATEWAY_PID_FILE.read_text().strip()}"
-            )
+            config = json.loads(CONFIG_FILE.read_text())
+            embedded_cloudflare = bool(config.get("cloudflare"))
+            if embedded_cloudflare:
+                cf_running = sb_running
+            gateway_required = bool(config.get("ssh_file"))
+            gateway_running = process_running(GATEWAY_PID_FILE)
         except (OSError, ValueError, json.JSONDecodeError):
             gateway_running = False
 
@@ -705,7 +722,8 @@ def check_status():
         print("\033[36m╭───────────────────────────────────────────────────────────────╮\033[0m")
         print("\033[36m│                \033[33m✨ ArgoSB 运行状态 ✨                    \033[36m│\033[0m")
         print("\033[36m├───────────────────────────────────────────────────────────────┤\033[0m")
-        print("\033[36m│ \033[32m服务状态: \033[33m正在运行 (sing-box & cloudflared)\033[0m")
+        service = "sing-box（内置 Cloudflare Tunnel，连接状态见 sb.log）" if embedded_cloudflare else "sing-box & cloudflared"
+        print(f"\033[36m│ \033[32m服务进程: \033[33m正在运行 ({service})\033[0m")
         
         domain_to_display = "未知"
         if CUSTOM_DOMAIN_FILE.exists():
@@ -741,7 +759,7 @@ def check_status():
     status_msgs = []
     if not sb_running: status_msgs.append("sing-box 未运行")
     if gateway_required and not gateway_running: status_msgs.append("UUID 文件网关未运行")
-    if not cf_running: status_msgs.append("cloudflared 未运行")
+    if not cf_running and not embedded_cloudflare: status_msgs.append("cloudflared 未运行")
     if not LIST_FILE.exists(): status_msgs.append("节点信息文件未生成")
 
     print("\033[36m╭───────────────────────────────────────────────────────────────╮\033[0m")
@@ -760,7 +778,7 @@ def check_status():
 
 
 # 创建sing-box配置
-def create_sing_box_config(port_vm_ws, uuid_str, tailscale=None):
+def create_sing_box_config(port_vm_ws, uuid_str, tailscale=None, cloudflare=None):
     write_debug_log(f"创建sing-box配置，端口: {port_vm_ws}, UUID: {uuid_str}")
     ws_path = f"/{uuid_str[:8]}-vm" # 和 generate_links 中的路径保持一致
 
@@ -779,8 +797,10 @@ def create_sing_box_config(port_vm_ws, uuid_str, tailscale=None):
         "outbounds": [{"type": "direct", "tag": "direct"}]
     }
     sb_config_file = INSTALL_DIR / "sb.json"
-    if tailscale:
-        from tailscale_support import add_endpoint, validate_config
+    if tailscale or cloudflare:
+        from tailscale_support import add_cloudflare, add_endpoint, validate_config
+        if cloudflare:
+            add_cloudflare(config_dict)
         add_endpoint(config_dict, tailscale, INSTALL_DIR)
         validate_config(INSTALL_DIR / "sing-box", config_dict)
     with open(sb_config_file, 'w') as f:
@@ -914,7 +934,7 @@ def create_startup_script():
     install_dir = shlex.quote(str(INSTALL_DIR.resolve()))
 
     sb_command = "./sing-box run -c sb.json"
-    if config.get("tailscale"):
+    if config.get("tailscale") or config.get("cloudflare"):
         import tailscale_support
         helper_path = INSTALL_DIR / "tailscale_support.py"
         source_path = Path(tailscale_support.__file__).resolve()
@@ -944,6 +964,11 @@ echo $! > {shlex.quote(GATEWAY_PID_FILE.name)}
         gateway_start_script_path.unlink()
 
     cf_start_script_path = INSTALL_DIR / "start_cf.sh"
+    if config.get("cloudflare"):
+        # Replace any launcher from the previous standalone installation.
+        cf_start_script_path.unlink(missing_ok=True)
+        write_debug_log("启动脚本已创建: Cloudflare Tunnel 使用 sing-box 内置入站")
+        return
     cf_cmd_base = "./cloudflared tunnel --no-autoupdate"
     origin_url = f"http://127.0.0.1:{gateway_port}"
     if argo_token:
@@ -987,39 +1012,74 @@ def stop_managed_service(pid_file, binary):
         return
 
 
+def process_running(pid_file):
+    try:
+        pid = int(pid_file.read_text().strip())
+        if pid <= 0 or not Path(f"/proc/{pid}/exe").exists():
+            return False
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def service_pid_files(config):
+    services = [("sing-box", SB_PID_FILE)]
+    if not config.get("cloudflare"):
+        services.append(("cloudflared", ARGO_PID_FILE))
+    if config.get("ssh_file"):
+        services.append(("UUID 文件网关", GATEWAY_PID_FILE))
+    return services
+
+
 # 启动服务
 def start_services():
+    config = json.loads(CONFIG_FILE.read_text())
+    embedded_cloudflare = bool(config.get("cloudflare"))
     stop_managed_service(SB_PID_FILE, INSTALL_DIR / "sing-box")
     stop_managed_service(ARGO_PID_FILE, INSTALL_DIR / "cloudflared")
+    if embedded_cloudflare:
+        ARGO_PID_FILE.unlink(missing_ok=True)
     print("正在启动sing-box服务...")
-    subprocess.run(str(INSTALL_DIR / "start_sb.sh"), shell=True)
+    subprocess.run(["bash", str(INSTALL_DIR / "start_sb.sh")], check=True)
     gateway_script = INSTALL_DIR / "start_gateway.sh"
     if gateway_script.exists():
         print("正在启动 UUID 文件网关...")
-        subprocess.run(str(gateway_script), shell=True)
+        subprocess.run(["bash", str(gateway_script)], check=True)
 
-    print("正在启动cloudflared服务...")
-    subprocess.run(str(INSTALL_DIR / "start_cf.sh"), shell=True)
-    
-    print("等待服务启动 (约5秒)...")
-    time.sleep(5)
-    config = json.loads(CONFIG_FILE.read_text())
-    for label, pid_file in (
-        ("sing-box", SB_PID_FILE),
-        ("cloudflared", ARGO_PID_FILE),
-        ("UUID 文件网关", GATEWAY_PID_FILE),
-    ):
-        if label == "UUID 文件网关" and not config.get("ssh_file"):
-            continue
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-        except (OSError, ValueError):
-            raise RuntimeError(f"{label} 启动失败；请检查 {INSTALL_DIR} 下的日志")
-    for port in {int(config.get("singbox_port", config["port_vm_ws"])), int(config["gateway_port"])}:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            if probe.connect_ex(("127.0.0.1", port)) != 0:
-                raise RuntimeError(f"本地端口 {port} 未监听；请检查 {INSTALL_DIR} 下的日志")
+    if embedded_cloudflare:
+        print("Cloudflare: waiting for sing-box startup (up to 120 seconds); edge registration is reported in sb.log", flush=True)
+    else:
+        print("正在启动cloudflared服务...")
+        subprocess.run(["bash", str(INSTALL_DIR / "start_cf.sh")], check=True)
+        print("等待服务启动 (约5秒)...")
+        time.sleep(5)
+
+    # Embedded Cloudflare may wait for four edge registrations before sing-box
+    # finishes startup. Keep forwarding its logs while waiting for the listener.
+    deadline = time.monotonic() + (120 if embedded_cloudflare else 0)
+    next_progress = time.monotonic() + 15
+    ports = {int(config.get("singbox_port", config["port_vm_ws"])), int(config["gateway_port"])}
+    while True:
+        for label, pid_file in service_pid_files(config):
+            if not process_running(pid_file):
+                raise RuntimeError(f"{label} 启动失败；请检查 {INSTALL_DIR} 下的日志")
+        pending = []
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1)
+                if probe.connect_ex(("127.0.0.1", port)) != 0:
+                    pending.append(port)
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"本地端口 {pending} 未监听；请检查 {INSTALL_DIR} 下的日志")
+        if time.monotonic() >= next_progress:
+            print("Cloudflare: sing-box is still starting; check edge connection diagnostics above", flush=True)
+            next_progress = time.monotonic() + 15
+        time.sleep(0.5)
+    if embedded_cloudflare:
+        print("Cloudflare: sing-box process and local listener are running; check inbound/cloudflared logs for tunnel connectivity", flush=True)
     write_debug_log("服务启动命令已执行。")
 
 # 获取tunnel域名 (仅用于Quick Tunnel)
@@ -1066,7 +1126,7 @@ def main():
         else:
             print(f"\033[31m节点文件 {all_nodes_path} 未找到。请先安装或运行 status。\033[0m")
     else: # 默认行为，通常是 'install' 或者检查后提示
-        if INSTALL_DIR.exists() and CONFIG_FILE.exists() and SB_PID_FILE.exists() and ARGO_PID_FILE.exists():
+        if INSTALL_DIR.exists() and CONFIG_FILE.exists() and SB_PID_FILE.exists():
             print("\033[33m检测到ArgoSB可能已安装并正在运行。\033[0m")
             if check_status():
                  print("\033[32m如需重新安装，请先执行卸载: python3 " + os.path.basename(__file__) + " del\033[0m")
@@ -1081,7 +1141,7 @@ if __name__ == "__main__":
     script_name = os.path.basename(__file__)
     if len(sys.argv) == 1: # 如果只运行脚本名，没有其他参数
         # 检查是否已安装，如果已安装且在运行，显示status，否则进行安装
-        if INSTALL_DIR.exists() and CONFIG_FILE.exists() and SB_PID_FILE.exists() and ARGO_PID_FILE.exists():
+        if INSTALL_DIR.exists() and CONFIG_FILE.exists() and SB_PID_FILE.exists():
             print(f"\033[33m检测到 ArgoSB 可能已安装。显示当前状态。\033[0m")
             print(f"\033[33m如需重新安装，请运行: python3 {script_name} install\033[0m")
             print(f"\033[33m如需卸载，请运行: python3 {script_name} del\033[0m")

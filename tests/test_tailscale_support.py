@@ -165,7 +165,10 @@ class TailscaleTests(unittest.TestCase):
             launcher.USER_HOME = Path(directory)
             state = Path(directory) / ".agsb"
             state.mkdir()
-            config = {"uuid_str": UUID, "port_vm_ws": 19999, "custom_domain_agn": "example.test"}
+            config = {
+                "uuid_str": UUID, "port_vm_ws": 19999, "custom_domain_agn": "example.test",
+                "cloudflare": tailscale.cloudflare_settings(settings["agk"]),
+            }
             for filename in ("sbpid.log", "sbargopid.log"):
                 (state / filename).write_text("12345")
             with patch.object(launcher, "_is_running", return_value=True):

@@ -455,7 +455,13 @@ export DOMAIN="your.domain.example"
 
 仓库自带 [Upterm 官方 v0.33.0](https://github.com/owenthereal/upterm/releases/tag/v0.33.0) 的 Linux x86_64 和 arm64 可执行文件，位于 `bin/`，许可证见 `bin/UPTERM-LICENSE`。启动时校验 SHA-256 并复制到 `~/upterm`，不再从网络下载；也可用 `UPTERM_BIN` 指向预装的可执行文件。容器通过 `wss://uptermd.upterm.dev` 的 443 端口连接中继，并固定官方中继主机密钥，不需要在容器内运行 `sshd`。日志直接输出 `ssh 用户名@uptermd.upterm.dev`，连接端只需 SSH 客户端且须能访问中继的 TCP 22 端口。Streamlit 重跑时会查询并重用已有会话；授权配置改变时会停止旧会话并建立新会话。
 
-Cloudflare 隧道仍使用 `AGK`。`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或 19999 端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`。隧道 token 仅连接已有隧道，不会自动创建 Public Hostname 路由。Streamlit 启动不修改 crontab。
+Streamlit 默认使用 sing-box 内置的 `cloudflared` 入站，Cloudflare Tunnel、VMess 和可选的 Tailscale SSH 共用同一个 sing-box 进程。隧道继续从 `AGK` 获取 token；`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`（例如 `PORT=19999` 时为 `http://localhost:19999`），路径规则可以保持 `*`。token 只连接已有的远程管理隧道，不会自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。
+
+内置隧道要求 sing-box ≥ 1.14.0 且包含 `with_cloudflared`，启动前会检查版本、编译标签和配置。默认自动选择协议，先尝试 QUIC，必要时回退到 HTTP/2；使用容器 DNS 解析控制服务、边缘节点和源站。`AGK` 仅在启动时注入匿名配置输入，不写进 `sb.json`、启动脚本或命令行，也会从 sing-box 子进程环境中移除。应用重跑会复用配置相同的进程；token、域名或 Tailscale 配置改变时重新启动。迁移时停止本安装目录中旧的独立 cloudflared，之后不再下载或启动该进程。
+
+Streamlit 应用日志持续显示 `Cloudflare:` 启动进度以及 `inbound/cloudflared[cloudflare-tunnel]` 的连接、重试和路由更新信息；完整日志位于 `~/.agsb/sb.log`。看到 `connected to ...` 表示边缘连接注册成功，`updated ingress configuration ...` 表示已收到远端路由配置；本地进程启动成功本身不能确认公网可用。内置隧道注册可能使 sing-box 启动耗时增加，安装脚本最多等待 120 秒，并每隔 15 秒输出等待进度。
+
+直接使用仓库中的安装脚本时，可通过 `python3 agsb-v2.py install --embedded-cloudflare --no-autostart --uuid "$UUID" --port "$PORT" --domain "$DOMAIN"` 启用同样的内置模式，运行和重启时需注入 `AGK`。不加此参数时保留原来的独立 cloudflared 和 Quick Tunnel 安装方式。
 
 ### 可选：在现有 sing-box 中启用 Tailscale SSH
 
