@@ -21,6 +21,7 @@ import tempfile
 import argparse
 import shlex
 import textwrap
+import signal
 
 # 全局变量
 INSTALL_DIR = Path.home() / ".agsb"  # 用户主目录下的隐藏文件夹，避免root权限
@@ -500,6 +501,13 @@ def install(args):
                 sys.exit(1)
 
     # --- 配置和启动 ---
+    tailscale = None
+    if os.environ.get("TAILSCALE_AUTH_KEY", "").strip():
+        from tailscale_support import settings_from_env
+        tailscale = settings_from_env(uuid_str)
+        print(f"Tailscale: enabling SSH in the existing sing-box; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}", flush=True)
+    # Validate before replacing configuration or stopping an existing service.
+    create_sing_box_config(singbox_port, uuid_str, tailscale=tailscale)
     config_data = {
         "uuid_str": uuid_str,
         "port_vm_ws": public_port,
@@ -512,6 +520,7 @@ def install(args):
         ),
         "argo_token": None,
         "tunnel_token_present": bool(argo_token),
+        "tailscale": tailscale,
         "custom_domain_agn": custom_domain, # Will be None if not provided
         "install_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
@@ -526,7 +535,6 @@ def install(args):
         TUNNEL_TOKEN_FILE.unlink()
     write_debug_log(f"生成配置文件: {CONFIG_FILE} (tunnel token present: {bool(argo_token)})")
 
-    create_sing_box_config(singbox_port, uuid_str)
     if ssh_file:
         create_gateway_script(public_port, singbox_port, ssh_file)
     create_startup_script() # Now reads from config for token
@@ -752,7 +760,7 @@ def check_status():
 
 
 # 创建sing-box配置
-def create_sing_box_config(port_vm_ws, uuid_str):
+def create_sing_box_config(port_vm_ws, uuid_str, tailscale=None):
     write_debug_log(f"创建sing-box配置，端口: {port_vm_ws}, UUID: {uuid_str}")
     ws_path = f"/{uuid_str[:8]}-vm" # 和 generate_links 中的路径保持一致
 
@@ -771,6 +779,10 @@ def create_sing_box_config(port_vm_ws, uuid_str):
         "outbounds": [{"type": "direct", "tag": "direct"}]
     }
     sb_config_file = INSTALL_DIR / "sb.json"
+    if tailscale:
+        from tailscale_support import add_endpoint, validate_config
+        add_endpoint(config_dict, tailscale, INSTALL_DIR)
+        validate_config(INSTALL_DIR / "sing-box", config_dict)
     with open(sb_config_file, 'w') as f:
         json.dump(config_dict, f, indent=2)
     write_debug_log(f"sing-box配置已写入文件: {sb_config_file}")
@@ -901,10 +913,19 @@ def create_startup_script():
     argo_token = TUNNEL_TOKEN_FILE.exists() or bool(config.get("argo_token"))
     install_dir = shlex.quote(str(INSTALL_DIR.resolve()))
 
+    sb_command = "./sing-box run -c sb.json"
+    if config.get("tailscale"):
+        import tailscale_support
+        helper_path = INSTALL_DIR / "tailscale_support.py"
+        source_path = Path(tailscale_support.__file__).resolve()
+        if source_path != helper_path.resolve():
+            shutil.copyfile(source_path, helper_path)
+        sb_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(helper_path.resolve()))} {install_dir}"
+
     sb_start_script_path = INSTALL_DIR / "start_sb.sh"
     sb_start_content = f'''#!/bin/bash
 cd {install_dir}
-./sing-box run -c sb.json > sb.log 2>&1 &
+{sb_command} > sb.log 2>&1 &
 echo $! > {shlex.quote(SB_PID_FILE.name)}
 '''
     sb_start_script_path.write_text(sb_start_content)
@@ -946,8 +967,30 @@ echo $! > {shlex.quote(ARGO_PID_FILE.name)}
         f"gateway_port={gateway_port}, ssh_file={ssh_file}"
     )
 
+# Stop only processes owned by this installation before replacing them.
+def stop_managed_service(pid_file, binary):
+    try:
+        pid = int(pid_file.read_text().strip())
+        executable = Path(f"/proc/{pid}/exe").resolve()
+        if executable != binary.resolve():
+            return
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not Path(f"/proc/{pid}/exe").exists():
+                break
+            time.sleep(0.1)
+        else:
+            if Path(f"/proc/{pid}/exe").resolve() == executable:
+                os.kill(pid, signal.SIGKILL)
+    except (OSError, ValueError):
+        return
+
+
 # 启动服务
 def start_services():
+    stop_managed_service(SB_PID_FILE, INSTALL_DIR / "sing-box")
+    stop_managed_service(ARGO_PID_FILE, INSTALL_DIR / "cloudflared")
     print("正在启动sing-box服务...")
     subprocess.run(str(INSTALL_DIR / "start_sb.sh"), shell=True)
     gateway_script = INSTALL_DIR / "start_gateway.sh"

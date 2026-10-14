@@ -457,6 +457,24 @@ export DOMAIN="your.domain.example"
 
 Cloudflare 隧道仍使用 `AGK`。`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或 19999 端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`。隧道 token 仅连接已有隧道，不会自动创建 Public Hostname 路由。Streamlit 启动不修改 crontab。
 
+### 可选：在现有 sing-box 中启用 Tailscale SSH
+
+在上述配置之外注入环境变量（或 Streamlit Secrets 顶层字段）：
+
+```bash
+export TAILSCALE_AUTH_KEY="tskey-auth-..."
+export TAILSCALE_HOSTNAME="streamlit-agsb"  # 可选，默认 agsb-UUID前8位
+export TAILSCALE_EPHEMERAL="true"          # 可选，默认 true
+```
+
+设置 `TAILSCALE_AUTH_KEY` 后，安装脚本将 `tailscale` endpoint 和 `ssh_server: true` 加入现有 `sb.json`，使用同一个 sing-box 进程；Upterm 继续启动。要求 sing-box ≥ 1.14.0 且包含 `with_tailscale`，启动前会检查版本和配置。endpoint 使用用户态网络，无需 root、TUN 设备或额外的 tailscaled/sshd。VMess 继续使用 direct 出站；Tailscale endpoint 只接收内置 SSH 服务处理的连接。
+
+Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-box 的标准输入传入；不会写进 `sb.json`、启动脚本或命令行。节点身份保存在 `~/.agsb/tailscale/`，应用重跑或保留此目录的重启会复用身份。完整重建容器后仍可能注册新节点，因此建议生成 **Reusable + Ephemeral** 的 Auth Key；离线临时节点由 Tailscale 自动清理，固定 hostname 本身不能防止重复注册。移除 Auth Key 后，下次应用执行会重新生成不含该 endpoint 的配置。
+
+Streamlit 应用日志会显示 `Tailscale:` 启动信息、`endpoint/tailscale[tailscale-ssh]` 注册诊断，以及 `Tailscale SSH connection: ssh appuser@streamlit-agsb`。用户名从当前运行用户获取；此命令输出时节点可能仍在注册，先在 Tailscale 控制台确认节点在线。详细原始日志位于 `~/.agsb/sb.log`。日志持续转发由一个后台线程完成，不增加服务进程。
+
+连接电脑先登录同一个 tailnet，启用 MagicDNS，并在 Tailscale 策略中允许到该节点的 TCP 22 和 SSH 登录到日志中的用户（Streamlit 通常为 `appuser`）。然后直接执行日志中的 `ssh ...` 命令。若 Auth Key 带设备标签，SSH 策略的 `dst` 应使用对应标签；默认的 `autogroup:self` 规则可能不适用于标签节点。实际节点名出现重名后缀时，以控制台中的 MagicDNS 名称或 Tailscale IP 为准。详见 [Tailscale SSH 策略](https://tailscale.com/kb/1193/tailscale-ssh) 和 [sing-box Tailscale endpoint](https://sing-box.sagernet.org/zh/configuration/endpoint/tailscale/)。
+
 ## 🌐 Glitch 网站保活脚本
 
 > **模拟真人浏览行为，防止 Glitch 项目休眠**
