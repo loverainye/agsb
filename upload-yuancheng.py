@@ -152,6 +152,8 @@ def launch_installer(settings):
     print(f"Cloudflare: enabled in sing-box; DOMAIN={settings['domain']}, origin=http://localhost:{settings['port']}; diagnostics will appear in app logs", flush=True)
     if tailscale:
         print(f"Tailscale: enabled; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}; diagnostics will appear in app logs", flush=True)
+        print(f"Tailscale VMess: server=<node Tailscale IP> or {tailscale['hostname']}; port={settings['port']}; transport=ws; path=/{uuid_value[:8]}-vm; TLS=off", flush=True)
+        print(f"Tailscale: the proxy client must join the tailnet and ACL/grants must allow TCP {settings['port']}", flush=True)
     if _installer_already_started(settings):
         print(f"ArgoSB 安装流程已在后台运行，UUID={uuid_value}")
         if tailscale:

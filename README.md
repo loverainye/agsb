@@ -473,7 +473,11 @@ export TAILSCALE_HOSTNAME="streamlit-agsb"  # 可选，默认 agsb-UUID前8位
 export TAILSCALE_EPHEMERAL="true"          # 可选，默认 true
 ```
 
-设置 `TAILSCALE_AUTH_KEY` 后，安装脚本将 `tailscale` endpoint 和 `ssh_server: true` 加入现有 `sb.json`，使用同一个 sing-box 进程；Upterm 继续启动。要求 sing-box ≥ 1.14.0 且包含 `with_tailscale`，启动前会检查版本和配置。endpoint 使用用户态网络，无需 root、TUN 设备或额外的 tailscaled/sshd。VMess 继续使用 direct 出站；Tailscale endpoint 只接收内置 SSH 服务处理的连接。
+设置 `TAILSCALE_AUTH_KEY` 后，安装脚本将 `tailscale` endpoint 和 `ssh_server: true` 加入现有 `sb.json`，使用同一个 sing-box 进程；Upterm 继续启动。要求 sing-box ≥ 1.14.0 且包含 `with_tailscale`，启动前会检查版本和配置。endpoint 使用用户态网络，无需 root、TUN 设备或额外的 tailscaled/sshd。VMess 继续使用 direct 出站；Tailscale 同时提供内置 SSH 和 VMess 端口转发。
+
+启用 Tailscale 后，节点自身 Tailscale IP 的 TCP `$PORT` 会转发至 `127.0.0.1:$PORT` 的 VMess/WebSocket 入站，兼容节点的 Tailscale IPv4 和 IPv6 地址；VMess 仍监听回环地址。转发规则只允许这个 TCP 端口，其余未被内置 SSH 等服务处理的流量仍拒绝。`PORT=22` 会与 SSH 冲突，需选择其他端口。升级前已运行的 SSH 配置会在应用下次执行时重新生成并重启，节点状态目录保留。
+
+本地运行 daed 或其他代理客户端的机器先接入同一个 tailnet，并在 Tailscale ACL/grants 中允许到节点的 TCP `$PORT`。节点配置使用：服务器为控制台显示的 Tailscale IP（或可解析的 MagicDNS 名称），端口为 `$PORT`，协议为 VMess，UUID 不变，WebSocket 路径为 `/UUID前8位-vm`，关闭 TLS，传输由 Tailscale 加密。确保到 Tailscale IP 的底层连接走 Tailscale 网络。Cloudflare 隧道同时保留，原来的域名节点继续使用各自的 TLS/端口配置。应用日志会输出 `Tailscale VMess:` 参数和端口转发信息。
 
 Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-box 的标准输入传入；不会写进 `sb.json`、启动脚本或命令行。节点身份保存在 `~/.agsb/tailscale/`，应用重跑或保留此目录的重启会复用身份。完整重建容器后仍可能注册新节点，因此建议生成 **Reusable + Ephemeral** 的 Auth Key；离线临时节点由 Tailscale 自动清理，固定 hostname 本身不能防止重复注册。移除 Auth Key 后，下次应用执行会重新生成不含该 endpoint 的配置。
 

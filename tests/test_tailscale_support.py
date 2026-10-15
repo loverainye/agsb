@@ -91,6 +91,46 @@ class TailscaleTests(unittest.TestCase):
                     tailscale.validate_config(binary, config)
                 self.assertEqual(run.call_count, 1)
 
+    def test_proxy_forwarding_tracks_port_and_preserves_cloudflare_and_ssh(self):
+        installer = load_script("installer_tailscale_forwarding", "agsb-v2.py")
+        settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
+        with tempfile.TemporaryDirectory() as directory:
+            installer.INSTALL_DIR = Path(directory)
+            installer.DEBUG_LOG = Path(directory) / "debug.log"
+            for port in (19999, 21111):
+                with patch.object(tailscale, "validate_config"):
+                    installer.create_sing_box_config(
+                        port, UUID, tailscale=settings,
+                        cloudflare=tailscale.cloudflare_settings("test-token"),
+                    )
+                config = json.loads((Path(directory) / "sb.json").read_text())
+                rules = config["route"]["rules"]
+                forwarded = [rule for rule in rules if rule.get("inbound") == [tailscale.TAILSCALE_TAG] and rule["action"] == "route"]
+                self.assertEqual(len(forwarded), 1)
+                rule = forwarded[0]
+                self.assertEqual(rule["port"], [port])
+                self.assertEqual(rule["network"], "tcp")
+                self.assertEqual(set(rule["ip_cidr"]), {"127.0.0.1/32", "::1/128"})
+                self.assertEqual((rule["outbound"], rule["override_address"], rule["override_port"]), ("direct", "127.0.0.1", port))
+                reject = {"inbound": [tailscale.TAILSCALE_TAG], "action": "reject"}
+                self.assertLess(rules.index(rule), rules.index(reject))
+                self.assertIn({"inbound": [tailscale.CLOUDFLARE_TAG], "action": "route", "outbound": "direct"}, rules)
+                self.assertEqual(config["inbounds"][0]["listen"], "127.0.0.1")
+                self.assertTrue(config["endpoints"][0]["ssh_server"])
+                self.assertFalse(config["endpoints"][0]["system_interface"])
+
+    def test_ssh_port_conflict_does_not_replace_existing_configuration(self):
+        installer = load_script("installer_tailscale_port_conflict", "agsb-v2.py")
+        with tempfile.TemporaryDirectory() as directory:
+            installer.INSTALL_DIR = Path(directory)
+            installer.DEBUG_LOG = Path(directory) / "debug.log"
+            installer.create_sing_box_config(19999, UUID)
+            original = (Path(directory) / "sb.json").read_text()
+            settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
+            with self.assertRaisesRegex(ValueError, "conflicts with Tailscale SSH"):
+                installer.create_sing_box_config(22, UUID, tailscale=settings)
+            self.assertEqual((Path(directory) / "sb.json").read_text(), original)
+
     def test_startup_exec_keeps_pid_and_credentials_stay_in_stdin(self):
         installer = load_script("installer_exec", "agsb-v2.py")
         with tempfile.TemporaryDirectory(prefix="agsb test ") as directory:
@@ -176,6 +216,10 @@ class TailscaleTests(unittest.TestCase):
                     (state / "config.json").write_text(json.dumps(config))
                     self.assertFalse(launcher._installer_already_started(settings))
                     config["tailscale"] = tailscale.settings_from_env(UUID)
+                    config["tailscale"].pop("proxy_forwarding")
+                    (state / "config.json").write_text(json.dumps(config))
+                    self.assertFalse(launcher._installer_already_started(settings))
+                    config["tailscale"]["proxy_forwarding"] = True
                     (state / "config.json").write_text(json.dumps(config))
                     self.assertTrue(launcher._installer_already_started(settings))
                     with patch.dict(os.environ, {"TAILSCALE_HOSTNAME": "other-host"}):

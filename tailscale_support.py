@@ -64,6 +64,8 @@ def settings_from_env(uuid_value, environ=None):
         "hostname": hostname.lower(),
         "ephemeral": ephemeral in ("true", "1"),
         "auth_key_hash": hashlib.sha256(key.encode()).hexdigest(),
+        # Reconfigure existing SSH-only installations on the next app run.
+        "proxy_forwarding": True,
     }
 
 
@@ -98,8 +100,28 @@ def add_endpoint(config, settings, install_dir):
     config.setdefault("endpoints", []).append(endpoint)
     # The endpoint resolves control-plane/DERP hosts with the container DNS.
     _add_local_resolver(config)
+    rules = config["route"].setdefault("rules", [])
+    for inbound in config.get("inbounds", []):
+        if inbound.get("tag") == "vmess-in" and inbound.get("type") == "vmess":
+            port = int(inbound["listen_port"])
+            if port == 22:
+                raise ValueError("PORT=22 conflicts with Tailscale SSH; choose another VMess port")
+            # The endpoint maps its own Tailscale IPv4/IPv6 destinations to
+            # 127.0.0.1/::1. Route both to the existing IPv4 VMess listener.
+            rules.append({
+                "inbound": [TAILSCALE_TAG],
+                "network": "tcp",
+                "ip_cidr": ["127.0.0.1/32", "::1/128"],
+                "port": [port],
+                "action": "route",
+                "outbound": "direct",
+                "override_address": "127.0.0.1",
+                "override_port": port,
+            })
+            print(f"Tailscale: forwarding tailnet TCP port {port} to 127.0.0.1:{port}; VMess/WebSocket authentication still applies", flush=True)
+            break
     # SSH is intercepted inside the endpoint, before sing-box routing.
-    config["route"].setdefault("rules", []).append({"inbound": [TAILSCALE_TAG], "action": "reject"})
+    rules.append({"inbound": [TAILSCALE_TAG], "action": "reject"})
     # tsnet's authentication and state diagnostics are emitted at debug level.
     config["log"]["level"] = "debug"
 
