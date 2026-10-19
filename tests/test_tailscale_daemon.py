@@ -80,17 +80,57 @@ class DaemonTests(unittest.TestCase):
             for name in env:
                 self.assertNotIn(name, run.call_args.kwargs["env"])
 
-    def test_new_node_logs_in_then_enables_connector_and_exit_node(self):
+    def test_new_node_configures_connector_and_exit_node_then_logs_in(self):
         with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), patch.object(daemon, "status", side_effect=[{"BackendState": "NeedsLogin"}, ONLINE]), patch.object(daemon, "cli") as cli, patch.object(daemon, "local_api", return_value={"AdvertiseRoutes": []}) as api:
             settings = {**SETTINGS, "advertise_tags": ["tag:app-connector"]}
             self.assertEqual(daemon.configure(Path("/tmp/test"), settings), ONLINE)
-            login = cli.call_args_list[0]
-            self.assertIn("--auth-key=file:/dev/stdin", login.args)
-            self.assertEqual(login.kwargs["input_value"], KEY)
-            self.assertIn("--advertise-connector", cli.call_args_list[1].args)
-            self.assertIn("--ssh", cli.call_args_list[1].args)
-            self.assertIn("--advertise-exit-node", cli.call_args_list[2].args)
-            self.assertEqual(api.call_args.args[2], {"AdvertiseTags": ["tag:app-connector"], "AdvertiseTagsSet": True})
+            self.assertIn("--advertise-connector", cli.call_args_list[0].args)
+            self.assertIn("--ssh", cli.call_args_list[0].args)
+            self.assertIn("--advertise-exit-node", cli.call_args_list[1].args)
+            self.assertEqual(api.call_args_list[-3].args[2], {"AdvertiseTags": ["tag:app-connector"], "AdvertiseTagsSet": True})
+            login = api.call_args_list[-2]
+            self.assertEqual(login.args[1:], ("POST", {"AuthKey": KEY}))
+            self.assertEqual(login.kwargs, {"resource": "start"})
+            self.assertEqual(api.call_args.kwargs, {"resource": "login-interactive"})
+            self.assertNotIn(KEY, str(cli.call_args_list))
+
+    def test_login_local_api_preserves_preferences_and_handles_empty_response(self):
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 204
+        response.read.return_value = b""
+        with patch.object(daemon, "_UnixHTTPConnection", return_value=connection):
+            self.assertEqual(daemon.local_api(Path("/tmp/test"), "POST", {"AuthKey": KEY}, resource="start"), {})
+        request = connection.request.call_args
+        self.assertEqual(request.args[:2], ("POST", "/localapi/v0/start"))
+        self.assertEqual(json.loads(request.args[2]), {"AuthKey": KEY})
+        connection.close.assert_called_once()
+
+    def test_login_local_api_errors_do_not_expose_auth_key(self):
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 500
+        response.read.return_value = ("invalid key: " + KEY).encode()
+        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), patch.object(daemon, "_UnixHTTPConnection", return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, "local start request failed") as error:
+                daemon.local_api(Path("/tmp/test"), "POST", {"AuthKey": KEY}, resource="start")
+        self.assertNotIn(KEY, str(error.exception))
+        connection.close.assert_called_once()
+
+    def test_starting_restored_node_waits_without_using_auth_key(self):
+        states = [{"BackendState": "NoState"}, {"BackendState": "NeedsLogin", "HaveNodeKey": True}, {"BackendState": "Starting"}, ONLINE]
+        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), patch.object(daemon, "status", side_effect=states), patch.object(daemon, "cli") as cli, patch.object(daemon, "local_api", return_value={"AdvertiseRoutes": ["0.0.0.0/0", "::/0"]}) as api, patch.object(daemon.time, "sleep"):
+            self.assertEqual(daemon.configure(Path("/tmp/test"), SETTINGS), ONLINE)
+            self.assertEqual(cli.call_count, 1)
+            self.assertTrue(all(call.args[1] != "POST" for call in api.call_args_list))
+
+    def test_restored_node_reauthenticates_only_after_startup_grace(self):
+        states = [{"BackendState": "NeedsLogin", "HaveNodeKey": True}] * 2 + [ONLINE]
+        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), patch.object(daemon, "status", side_effect=states), patch.object(daemon, "cli"), patch.object(daemon, "local_api", return_value={"AdvertiseRoutes": ["0.0.0.0/0", "::/0"]}) as api, patch.object(daemon.time, "sleep"), patch.object(daemon.time, "monotonic", side_effect=[0, 0, 5]):
+            self.assertEqual(daemon.configure(Path("/tmp/test"), SETTINGS), ONLINE)
+            login = [call for call in api.call_args_list if call.args[1] == "POST"]
+            self.assertEqual(len(login), 1)
+            self.assertEqual(login[0].args[2], {"AuthKey": KEY})
 
     def test_restored_node_preserves_login_tags_and_learned_routes(self):
         prefs = {"AdvertiseRoutes": ["0.0.0.0/0", "::/0", "203.0.113.1/32"]}
@@ -104,10 +144,10 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(api.call_count, 2)
 
     def test_missing_auth_and_device_approval_report_actionable_failure(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(daemon, "status", return_value={"BackendState": "NeedsLogin"}), patch.object(daemon, "cli") as cli:
+        with patch.dict(os.environ, {}, clear=True), patch.object(daemon, "status", return_value={"BackendState": "NeedsLogin"}), patch.object(daemon, "cli"), patch.object(daemon, "local_api", return_value={"AdvertiseRoutes": []}) as api:
             with self.assertRaisesRegex(RuntimeError, "TAILSCALE_AUTH_KEY"):
                 daemon.configure(Path("/tmp/test"), SETTINGS)
-            cli.assert_not_called()
+            self.assertTrue(all(call.args[1] != "POST" for call in api.call_args_list))
         with patch.object(daemon, "status", return_value={"BackendState": "NeedsMachineAuth"}), patch.object(daemon, "cli"), patch.object(daemon, "local_api", return_value={"AdvertiseRoutes": ["0.0.0.0/0", "::/0"]}):
             with self.assertRaisesRegex(RuntimeError, "admin device approval"):
                 daemon.configure(Path("/tmp/test"), SETTINGS)

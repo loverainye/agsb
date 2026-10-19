@@ -136,17 +136,17 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
-def local_api(install_dir, method, payload=None):
+def local_api(install_dir, method, payload=None, *, resource="prefs"):
     connection = _UnixHTTPConnection(Path(install_dir) / SOCKET_FILE)
     try:
-        connection.request(method, "/localapi/v0/prefs",
+        connection.request(method, f"/localapi/v0/{resource}",
                            None if payload is None else json.dumps(payload),
                            {"Content-Type": "application/json"})
         response = connection.getresponse()
         body = response.read().decode(errors="replace")
-        if response.status != 200:
-            raise RuntimeError("Tailscale: local preferences request failed: " + redact(body))
-        return json.loads(body)
+        if response.status not in (200, 204):
+            raise RuntimeError(f"Tailscale: local {resource} request failed: " + redact(body))
+        return json.loads(body) if body else {}
     finally:
         connection.close()
 
@@ -182,18 +182,10 @@ def prepare_state(install_dir, settings):
 
 
 def configure(install_dir, settings):
-    state = status(install_dir)
     key = os.environ.get("TAILSCALE_AUTH_KEY", "").strip()
-    needs_login = state.get("BackendState") in (None, "NoState", "NeedsLogin")
-    if needs_login and not key:
-        raise RuntimeError("Tailscale: restored node needs login; check node expiry or supply TAILSCALE_AUTH_KEY")
-    if needs_login:
-        # The key is read from stdin and never enters argv or a file.
-        cli(install_dir, "up", "--timeout=45s", "--auth-key=file:/dev/stdin", input_value=key, timeout=55)
-    else:
-        # `up --timeout` is not a bare up and may reject restored preferences.
-        # Change only WantRunning, preserving the existing identity and routes.
-        local_api(install_dir, "PATCH", {"WantRunning": True, "WantRunningSet": True})
+    # Resume the saved profile and edit only the preferences we manage. Even
+    # an authenticating `up --auth-key` rejects omitted non-default settings.
+    local_api(install_dir, "PATCH", {"WantRunning": True, "WantRunningSet": True})
     cli(install_dir, "set", "--advertise-connector", "--ssh",
         "--accept-dns=false", "--accept-routes=false", f"--hostname={settings['hostname']}")
     prefs = local_api(install_dir, "GET")
@@ -206,14 +198,38 @@ def configure(install_dir, settings):
         local_api(install_dir, "PATCH", {
             "AdvertiseTags": settings["advertise_tags"], "AdvertiseTagsSet": True,
         })
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 60
+    needs_login_since = None
+    login_requested = False
     while True:
         current = status(install_dir)
         backend = current.get("BackendState", "unknown")
         if backend == "Running":
             return current
-        if backend in ("NeedsLogin", "NeedsMachineAuth") or time.monotonic() >= deadline:
+        now = time.monotonic()
+        if backend == "NeedsMachineAuth" or now >= deadline:
             raise RuntimeError(f"Tailscale: node not ready ({backend}); inspect tailscale.log and admin device approval")
+        if backend == "NeedsLogin":
+            if needs_login_since is None:
+                needs_login_since = now
+            # A restored node can briefly report NeedsLogin while its saved
+            # credentials reconnect. Avoid consuming an auth key at that point.
+            restoring = current.get("HaveNodeKey") or settings.get("state_snapshot")
+            if not login_requested and (not restoring or now - needs_login_since >= 5):
+                if not key:
+                    raise RuntimeError("Tailscale: restored node needs login; check node expiry or supply TAILSCALE_AUTH_KEY")
+                print("Tailscale: authenticating the current profile without resetting preferences", flush=True)
+                # The private LocalAPI accepts AuthKey without UpdatePrefs,
+                # preserving identity, SSH, tags and learned connector routes.
+                # The key never enters process arguments or a credential file.
+                local_api(install_dir, "POST", {"AuthKey": key}, resource="start")
+                if not current.get("HaveNodeKey"):
+                    # Match the official CLI: a fresh profile also needs the
+                    # login transition after Start has received its auth key.
+                    local_api(install_dir, "POST", resource="login-interactive")
+                login_requested = True
+        else:
+            needs_login_since = None
         time.sleep(0.5)
 
 

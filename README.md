@@ -478,6 +478,8 @@ export TAILSCALE_ADVERTISE_TAGS="tag:app-connector"  # 可选，须先配置 tag
 
 二进制与 `~/.agsb/tailscale/` 身份目录使用不同路径。旧版误把 CLI 安装到 `~/.agsb/tailscale` 时，升级会验证它与新 CLI 的哈希一致，再移动至 `~/.agsb/bin/tailscale-legacy`，让出身份目录路径。已有身份目录及加密快照继续复用；同名未知文件会保留并报错提示检查。
 
+启动时先恢复当前配置并等待已有身份重连。确实需要登录时，启动器通过私有 Unix socket 传递环境变量中的 auth key，保留主机名、SSH、标签及 App Connector 路由；不会用 `tailscale up --reset` 清空这些设置。恢复节点短暂显示 `NeedsLogin` 时会先等待，避免立即重新认证。
+
 `tailscaled` 独立运行在 `--tun=userspace-networking` 模式，使用私有 Unix socket 和原来的 `~/.agsb/tailscale/` 身份目录，无需 root、TUN 或 systemd。启动器启用以下偏好：
 
 ```bash
