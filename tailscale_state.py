@@ -35,7 +35,7 @@ def _aesgcm(key):
 def _identity_name(name):
     # The state store includes machine keys, node keys and login profiles.
     # SSH host keys are separate files. Caches, logs and Taildrop are excluded.
-    return name == "tailscaled.state" or bool(re.fullmatch(r"ssh_host_[a-zA-Z0-9_.-]+", name))
+    return name == "tailscaled.state" or bool(re.fullmatch(r"(?:ssh/)?ssh_host_[a-zA-Z0-9_.-]+", name))
 
 
 def _validate(document):
@@ -68,12 +68,19 @@ def collect_state(state_dir, hostname):
     state_dir = Path(state_dir)
     for _ in range(3):
         files = {}
-        for path in sorted(state_dir.iterdir()):
-            if not _identity_name(path.name):
+        paths = list(state_dir.iterdir())
+        ssh_dir = state_dir / "ssh"
+        if ssh_dir.is_symlink() or (ssh_dir.exists() and not ssh_dir.is_dir()):
+            raise ValueError("Tailscale: unsafe SSH identity directory")
+        if ssh_dir.exists():
+            paths.extend(ssh_dir.iterdir())
+        for path in sorted(paths):
+            name = path.relative_to(state_dir).as_posix()
+            if not _identity_name(name):
                 continue
             if not stat.S_ISREG(path.lstat().st_mode) or path.stat().st_size > MAX_SIZE:
                 raise ValueError("Tailscale: identity files must be regular files smaller than 4 MiB")
-            files[path.name] = base64.b64encode(path.read_bytes()).decode("ascii")
+            files[name] = base64.b64encode(path.read_bytes()).decode("ascii")
         document = {"version": 1, "hostname": hostname.lower(), "files": files}
         decoded = _validate(document)
         if decoded["tailscaled.state"] == (state_dir / "tailscaled.state").read_bytes():
@@ -141,6 +148,12 @@ def restore_state(state_dir, environ=None):
         raise ValueError("Tailscale: state directory must not be a symlink")
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_dir.chmod(0o700)
+    if any(name.startswith("ssh/") for name in files):
+        ssh_dir = state_dir / "ssh"
+        if ssh_dir.is_symlink() or (ssh_dir.exists() and not ssh_dir.is_dir()):
+            raise ValueError("Tailscale: unsafe SSH identity directory")
+        ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        ssh_dir.chmod(0o700)
     for name in files:
         path = state_dir / name
         if path.is_symlink() or (path.exists() and not path.is_file()):

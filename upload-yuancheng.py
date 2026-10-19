@@ -4,13 +4,11 @@
 import os
 import sys
 import subprocess
-import signal
 import argparse
 import json
 import re
 import uuid as uuid_module
 from pathlib import Path
-from upterm_manager import UptermManager
 from tailscale_support import cloudflare_settings, settings_from_env, start_log_relay
 
 # 配置
@@ -46,16 +44,8 @@ def _default_uuid():
         return value
 
 
-def signal_handler(signum, frame):
-    """信号处理器"""
-    print("\n收到退出信号，正在清理...")
-    if hasattr(signal_handler, 'manager'):
-        signal_handler.manager.cleanup()
-    sys.exit(0)
-
-
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="启动 Upterm 和 ArgoSB")
+    parser = argparse.ArgumentParser(description="启动 ArgoSB、Cloudflare Tunnel 和 Tailscale SSH/出口节点")
     parser.add_argument("--uuid", default=None, help="sing-box 节点 UUID")
     parser.add_argument("--port", type=int, default=None, help="sing-box 本地端口")
     parser.add_argument("--agk", default=None, help="Cloudflare tunnel token")
@@ -133,9 +123,14 @@ def _installer_already_started(settings):
                 or config.get("cloudflare") != cloudflare
                 or config.get("tailscale") != tailscale):
             return False
+        if tailscale:
+            ready = json.loads((config_file.parent / "tailscale-ready.json").read_text())
+            if (ready.get("settings") != tailscale
+                    or ready.get("port") != int(config.get("singbox_port", port))):
+                return False
         return all(
             _is_running(int((config_file.parent / name).read_text().strip()))
-            for name in ("sbpid.log",)
+            for name in (("sbpid.log", "tailscale-launcher.pid", "tailscaled.pid") if tailscale else ("sbpid.log",))
         )
     except (OSError, ValueError, KeyError):
         return False
@@ -151,7 +146,9 @@ def launch_installer(settings):
     start_log_relay(state_dir, log_path, secrets=(settings["agk"],))
     print(f"Cloudflare: enabled in sing-box; DOMAIN={settings['domain']}, origin=http://localhost:{settings['port']}; diagnostics will appear in app logs", flush=True)
     if tailscale:
-        print(f"Tailscale: enabled; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}; diagnostics will appear in app logs", flush=True)
+        print(f"Tailscale: official userspace daemon enabled; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}; diagnostics will appear in app logs", flush=True)
+        print("Tailscale: --advertise-connector enabled; configure the connector tag and Apps/domains in the admin console", flush=True)
+        print("Tailscale: exit-node advertisement enabled; approve it in the admin console and select it on the client to use Internet egress", flush=True)
         print(f"Tailscale VMess: server=<node Tailscale IP> or {tailscale['hostname']}; port={settings['port']}; transport=ws; path=/{uuid_value[:8]}-vm; TLS=off", flush=True)
         print(f"Tailscale: the proxy client must join the tailnet and ACL/grants must allow TCP {settings['port']}", flush=True)
     if _installer_already_started(settings):
@@ -207,44 +204,23 @@ def main(argv=None):
         print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN", flush=True)
         return False
 
-    manager = UptermManager(home=USER_HOME)
-    
-    # 只在主线程中注册信号处理器
-    try:
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal_handler.manager = manager  # 保存引用用于信号处理
-    except ValueError:
-        # 如果不在主线程中（如Streamlit环境），跳过信号处理器注册
-        print("⚠ 检测到非主线程环境，跳过信号处理器注册", flush=True)
-    
-    try:
-        print("=== Upterm SSH 会话管理器 ===", flush=True)
-
-        # sing-box/Cloudflare and Upterm start independently.
-        installer_process = None
-        if not args.no_install:
-            installer_process = launch_installer(settings)
-
-        if not manager.prepare() or not manager.start():
-            if installer_process is not None:
-                status = installer_process.poll()
-                print("ArgoSB 安装进程仍在运行" if status is None else f"ArgoSB 安装进程退出码: {status}", flush=True)
-            return False
-        
-        print("\n=== 所有操作完成 ===")
-        print("✓ Upterm 会话已在后台运行")
-        print("Upterm 连接命令已在上方日志输出；ArgoSB 服务启动情况请查看后台日志。", flush=True)
-        
+    if args.no_install:
+        print("已跳过 ArgoSB 自动启动", flush=True)
         return True
-            
+
+    try:
+        print("=== ArgoSB 服务启动 ===", flush=True)
+        installer_process = launch_installer(settings)
+        if installer_process is not None:
+            status = installer_process.poll()
+            if status not in (None, 0):
+                print(f"ArgoSB 安装进程退出码: {status}", flush=True)
+                return False
+        print("ArgoSB 服务状态和 Tailscale SSH 连接信息请查看应用日志。", flush=True)
+        return True
     except Exception as e:
         print(f"✗ 程序执行出错: {e}", flush=True)
         return False
-    finally:
-        manager.cleanup()
-    
-    return True
 
 if __name__ == "__main__":
     success = main()

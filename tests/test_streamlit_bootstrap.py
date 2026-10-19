@@ -32,25 +32,26 @@ class BootstrapTests(unittest.TestCase):
         snapshot.start()
         self.addCleanup(snapshot.stop)
 
-    def test_installer_starts_when_upterm_is_unavailable(self):
-        launcher = load_script("launcher_install_first", "upload-yuancheng.py")
+    def test_main_starts_installer_and_reports_early_failure(self):
+        launcher = load_script("launcher_main", "upload-yuancheng.py")
         identifier = "123e4567-e89b-12d3-a456-426614174000"
-        with patch.object(launcher, "UptermManager") as manager_factory:
-            with patch.object(launcher, "launch_installer") as installer:
-                with patch.object(launcher.signal, "signal"):
-                    manager = manager_factory.return_value
-                    def prepare():
-                        self.assertTrue(installer.called)
-                        return False
+        for status, expected in ((None, True), (0, True), (1, False)):
+            with self.subTest(status=status), patch.object(launcher, "launch_installer") as installer:
+                installer.return_value.poll.return_value = status
+                self.assertEqual(launcher.main([
+                    "--uuid", identifier, "--port", "19999", "--agk", "token", "--domain", "example.test"
+                ]), expected)
+                installer.assert_called_once_with({
+                    "uuid": identifier, "port": 19999, "agk": "token", "domain": "example.test",
+                })
 
-                    manager.prepare.side_effect = prepare
-                    installer.return_value.poll.return_value = None
-                    self.assertFalse(launcher.main([
-                        "--uuid", identifier, "--agk", "token", "--domain", "example.test"
-                    ]))
-                    installer.assert_called_once()
-                    manager_factory.assert_called_once_with(home=launcher.USER_HOME)
-                    manager.start.assert_not_called()
+    def test_no_install_skips_background_services(self):
+        launcher = load_script("launcher_no_install", "upload-yuancheng.py")
+        with patch.object(launcher, "launch_installer") as installer:
+            self.assertTrue(launcher.main([
+                "--no-install", "--uuid", "123e4567-e89b-12d3-a456-426614174000",
+            ]))
+            installer.assert_not_called()
 
     def test_settings_use_port_environment(self):
         launcher = load_script("launcher", "upload-yuancheng.py")

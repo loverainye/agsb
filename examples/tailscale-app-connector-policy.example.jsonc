@@ -1,0 +1,61 @@
+// 合并到现有 tailnet 策略；不要直接覆盖现有授权。
+// 服务端设置 TAILSCALE_ADVERTISE_TAGS=tag:app-connector，或在控制台分配标签。
+// 示例使用 GitHub 预设，也可在控制台 Apps 中选择自己的域名。
+{
+  "tagOwners": {
+    "tag:app-connector": ["autogroup:admin"]
+  },
+  "autoApprovers": {
+    "routes": {
+      // 自动批准此标签节点学习的 IPv4/IPv6 路由。
+      // 这里是批准范围，不会让节点自动宣告所有公网路由。
+      "0.0.0.0/0": ["tag:app-connector"],
+      "::/0": ["tag:app-connector"]
+    }
+    // 全局出口需另外在控制台批准；此示例不自动批准出口节点。
+  },
+  "grants": [
+    {
+      // 允许成员通过连接器访问公网应用，也支持手动选中的出口节点。
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:internet"],
+      "ip": ["*"]
+    },
+    {
+      // DNS 查询供连接器学习目标域名；SSH/VMess 访问单独允许。
+      // 若 PORT 改变，同步修改 tcp:19999。
+      "src": ["autogroup:member"],
+      "dst": ["tag:app-connector"],
+      "ip": ["tcp:53", "udp:53", "tcp:19999"]
+    },
+    {
+      "src": ["autogroup:admin"],
+      "dst": ["tag:app-connector"],
+      "ip": ["tcp:22"]
+    }
+  ],
+  "ssh": [
+    {
+      // 普通用户运行的 tailscaled 只能切换到自身用户。
+      // Streamlit 为 appuser；其他环境替换成实际运行用户。
+      "action": "check",
+      "src": ["autogroup:admin"],
+      "dst": ["tag:app-connector"],
+      "users": ["appuser"]
+    }
+  ],
+  "nodeAttrs": [
+    {
+      "target": ["*"],
+      "app": {
+        "tailscale.com/app-connectors": [
+          {
+            "name": "GitHub",
+            "connectors": ["tag:app-connector"],
+            "presetAppID": "github"
+          }
+        ]
+      }
+    }
+  ]
+}

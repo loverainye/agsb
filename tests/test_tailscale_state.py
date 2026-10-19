@@ -96,6 +96,29 @@ class SnapshotTests(unittest.TestCase):
             state.restore_state(target, {state.KEY_ENV: KEY})
         self.assertEqual(outside.read_text(), "untouched")
 
+    def test_official_ssh_directory_roundtrip_and_symlink_rejection(self):
+        ssh_dir = self.source / "ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "ssh_host_ed25519_key").write_text("newer-private-ssh-test")
+        (ssh_dir / "unrelated-file").write_text("exclude")
+        document = state.collect_state(self.source, "streamlit-agsb")
+        self.assertIn("ssh/ssh_host_ed25519_key", document["files"])
+        self.assertNotIn("ssh/unrelated-file", document["files"])
+        self.snapshot.write_bytes(state.encrypt(document, KEY))
+        target = self.root / "official-node"
+        state.restore_state(target, {state.KEY_ENV: KEY})
+        key = target / "ssh" / "ssh_host_ed25519_key"
+        self.assertEqual(key.read_text(), "newer-private-ssh-test")
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(key.parent.stat().st_mode & 0o777, 0o700)
+        unsafe = self.root / "unsafe-node"
+        unsafe.mkdir()
+        (unsafe / "ssh").symlink_to(ssh_dir)
+        with self.assertRaisesRegex(ValueError, "unsafe SSH"):
+            state.restore_state(unsafe, {state.KEY_ENV: KEY})
+        with self.assertRaisesRegex(ValueError, "unsafe SSH"):
+            state.collect_state(unsafe, "streamlit-agsb")
+
     def test_settings_enable_with_snapshot_only_and_fail_closed(self):
         env = {state.KEY_ENV: KEY}
         settings = support.settings_from_env("new-random-uuid", env)
@@ -108,14 +131,11 @@ class SnapshotTests(unittest.TestCase):
                 support.settings_from_env("uuid", {**env, **extra})
         with self.assertRaisesRegex(ValueError, "TAILSCALE_STATE_KEY"):
             support.settings_from_env("uuid", {"TAILSCALE_AUTH_KEY": "bootstrap-key"})
-        config = {"endpoints": [{"type": "tailscale", "tag": support.TAILSCALE_TAG}]}
-        runtime = json.loads(support.runtime_config(config, env))
-        self.assertNotIn("auth_key", runtime["endpoints"][0])
         with patch.dict(os.environ, env, clear=True):
             self.assertNotIn(state.KEY_ENV, support.singbox_environment())
             self.assertEqual(support.redact(KEY), "[redacted]")
 
-    def test_installed_launcher_restores_before_exec_without_key_environment(self):
+    def test_installed_daemon_restores_legacy_identity_without_key_in_child(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location("snapshot_installer", Path(__file__).resolve().parents[1] / "agsb-v2.py")
         installer = importlib.util.module_from_spec(spec)
@@ -129,34 +149,28 @@ class SnapshotTests(unittest.TestCase):
         installer.DEBUG_LOG = installed / "debug.log"
         env = {state.KEY_ENV: KEY}
         settings = support.settings_from_env("uuid", env)
-        config = {"log": {"level": "info"}}
-        support.add_endpoint(config, settings, installed)
-        (installed / "sb.json").write_text(json.dumps(config))
         installer.CONFIG_FILE.write_text(json.dumps({"port_vm_ws": 19999, "tailscale": settings}))
         installer.create_startup_script()
         self.assertEqual((installed / "tailscale-state.enc").read_bytes(), self.snapshot.read_bytes())
-        binary = installed / "sing-box"
-        binary.write_text(
-            f"#!{sys.executable}\nimport os,sys,json\nfrom pathlib import Path\n"
-            "config=json.load(sys.stdin)\ne=config['endpoints'][0]\n"
-            "print(json.dumps({'pid':os.getpid(),'key':os.getenv('TAILSCALE_STATE_KEY'),"
-            "'state_exists':(Path(e['state_directory'])/'tailscaled.state').is_file(),"
-            "'ephemeral':e['ephemeral'],'has_auth':'auth_key' in e}))\n"
+        # Exercise the installed daemon's restore function with the synthetic
+        # encrypted identity; never enroll or run the repository's real node.
+        process = subprocess.run(
+            [sys.executable, "-c",
+             "import json,os; from pathlib import Path; import tailscale_daemon as d; "
+             "settings=json.loads(Path('config.json').read_text())['tailscale']; "
+             "directory=d.prepare_state(Path.cwd(),settings); "
+             "print(json.dumps({'identity':(directory/'tailscaled.state').read_text(),"
+             "'key_in_child': 'TAILSCALE_STATE_KEY' in d.singbox_environment()}))"],
+            cwd=installed, capture_output=True, text=True, env={**os.environ, **env}, timeout=10,
         )
-        binary.chmod(0o755)
-        process = subprocess.Popen(
-            [sys.executable, str(installed / "tailscale_support.py"), str(installed)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**os.environ, **env},
-        )
-        stdout, stderr = process.communicate(timeout=10)
-        self.assertEqual(process.returncode, 0, stderr + stdout)
-        reported = json.loads(stdout.splitlines()[-1])
-        self.assertTrue(reported["state_exists"])
-        self.assertEqual(reported["pid"], process.pid)
-        self.assertIsNone(reported["key"])
-        self.assertFalse(reported["ephemeral"])
-        self.assertFalse(reported["has_auth"])
-        self.assertNotIn(KEY, stdout + stderr)
+        self.assertEqual(process.returncode, 0, process.stderr + process.stdout)
+        reported = json.loads(process.stdout.splitlines()[-1])
+        self.assertEqual(json.loads(reported["identity"]), json.loads(self.identity))
+        hostkey = installed / "tailscale" / "ssh" / "ssh_host_ed25519_key"
+        self.assertEqual(hostkey.read_text(), "private-ssh-test")
+        self.assertEqual(hostkey.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(reported["key_in_child"])
+        self.assertNotIn(KEY, process.stdout + process.stderr)
 
 
 if __name__ == "__main__":

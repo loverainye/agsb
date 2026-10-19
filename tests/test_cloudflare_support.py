@@ -69,8 +69,7 @@ class CloudflareTests(unittest.TestCase):
                 self.assertNotIn("token", template["inbounds"][1])
                 self.assertEqual(template["route"]["final"], "direct")
                 self.assertIn({"inbound": [support.CLOUDFLARE_TAG], "action": "route", "outbound": "direct"}, template["route"]["rules"])
-                if endpoint:
-                    self.assertIn({"inbound": [support.TAILSCALE_TAG], "action": "reject"}, template["route"]["rules"])
+                self.assertNotIn("endpoints", template)
                 runtime = json.loads(support.runtime_config(template, {"agk": TOKEN, "TAILSCALE_AUTH_KEY": KEY}))
                 self.assertEqual(runtime["inbounds"][1]["token"], TOKEN)
                 self.assertNotIn(TOKEN, json.dumps(settings))
@@ -94,10 +93,6 @@ class CloudflareTests(unittest.TestCase):
             self.assertEqual(json.loads(run.call_args.kwargs["input"])["inbounds"][0]["token"], TOKEN)
             self.assertNotIn(TOKEN, str(run.call_args.args))
             self.assertNotIn("AGK", run.call_args.kwargs["env"])
-        config["endpoints"] = [{"tag": support.TAILSCALE_TAG}]
-        with patch.object(support.subprocess, "run", return_value=version):
-            with self.assertRaisesRegex(RuntimeError, "with_tailscale"):
-                support.validate_config("sing-box", config)
 
     def test_cloudflare_launcher_keeps_pid_and_removes_token_environment_without_tailscale(self):
         with installation() as (installer, state):
@@ -160,6 +155,34 @@ class CloudflareTests(unittest.TestCase):
             self.assertFalse(installer.ARGO_PID_FILE.exists())
             with patch.object(installer, "stop_managed_service"), patch.object(installer.subprocess, "run"), patch.object(installer, "process_running", return_value=False):
                 with self.assertRaisesRegex(RuntimeError, "sing-box"):
+                    installer.start_services()
+
+    def test_install_and_start_independent_tailscale_service(self):
+        import tailscale_daemon
+        with installation() as (installer, state), patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True):
+            (state / "sing-box").write_text("existing binary")
+            args = SimpleNamespace(uuid=UUID, vmpt=21111, agk=TOKEN, agn="example.test", ssh_file=None, public_port=None, no_autostart=True, embedded_cloudflare=True)
+            with patch.object(tailscale_daemon, "ensure_binaries") as ensure, patch.object(support, "validate_config"), patch.object(installer, "start_services"), patch.object(installer, "generate_links"):
+                installer.install(args)
+            ensure.assert_called_once_with(state)
+            config = json.loads(installer.CONFIG_FILE.read_text())
+            self.assertTrue(config["tailscale"]["advertise_connector"])
+            self.assertNotIn("endpoints", json.loads((state / "sb.json").read_text()))
+            self.assertTrue((state / "start_tailscale.sh").exists())
+            (state / "tailscale-ready.json").write_text("{}")
+            with patch.object(installer, "stop_tailscale_services") as stop, patch.object(installer, "stop_managed_service"), patch.object(installer.subprocess, "run") as run, patch.object(installer, "process_running", return_value=True), patch.object(installer.socket, "socket") as socket:
+                socket.return_value.__enter__.return_value.connect_ex.return_value = 0
+                installer.start_services()
+                stop.assert_called_once()
+                self.assertEqual([call.args[0] for call in run.call_args_list], [
+                    ["bash", str(state / "start_sb.sh")],
+                    ["bash", str(state / "start_tailscale.sh")],
+                ])
+            (state / "tailscale-ready.json").unlink()
+            def running(pid_file):
+                return pid_file.name != "tailscale-launcher.pid"
+            with patch.object(installer, "stop_tailscale_services"), patch.object(installer, "stop_managed_service"), patch.object(installer.subprocess, "run"), patch.object(installer, "process_running", side_effect=running):
+                with self.assertRaisesRegex(RuntimeError, "Tailscale launcher"):
                     installer.start_services()
 
     def test_reuse_checks_token_domain_and_embedded_mode_for_running_installer(self):

@@ -517,7 +517,9 @@ def install(args):
     if os.environ.get("TAILSCALE_AUTH_KEY", "").strip() or os.environ.get("TAILSCALE_STATE_KEY", "").strip():
         from tailscale_support import settings_from_env
         tailscale = settings_from_env(uuid_str)
-        print(f"Tailscale: enabling SSH in the existing sing-box; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}", flush=True)
+        from tailscale_daemon import ensure_binaries
+        ensure_binaries(INSTALL_DIR)
+        print(f"Tailscale: enabling official tailscaled with SSH, exit node and --advertise-connector; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}", flush=True)
     # Validate before replacing configuration or stopping an existing service.
     create_sing_box_config(singbox_port, uuid_str, tailscale=tailscale, cloudflare=cloudflare)
     config_data = {
@@ -594,7 +596,10 @@ def setup_autostart():
             if str(script_name_sb) not in line and str(script_name_cf) not in line and str(script_name_gateway) not in line and line.strip()
         ]
         
+        filtered_lines = [line for line in filtered_lines if str((INSTALL_DIR / "start_tailscale.sh").resolve()) not in line]
         filtered_lines.append(f"@reboot {script_name_sb} >/dev/null 2>&1")
+        if (INSTALL_DIR / "start_tailscale.sh").exists():
+            filtered_lines.append(f"@reboot {(INSTALL_DIR / 'start_tailscale.sh').resolve()} >/dev/null 2>&1")
         if (INSTALL_DIR / "start_gateway.sh").exists():
             filtered_lines.append(f"@reboot {script_name_gateway} >/dev/null 2>&1")
         if (INSTALL_DIR / "start_cf.sh").exists():
@@ -617,6 +622,7 @@ def setup_autostart():
 
 # 卸载脚本
 def uninstall():
+    stop_tailscale_services()
     print("开始卸载服务...")
     
     # 停止服务
@@ -652,6 +658,7 @@ def uninstall():
             if script_name_sb_str not in line and script_name_cf_str not in line and script_name_gateway_str not in line and line.strip()
         ]
         
+        filtered_lines = [line for line in filtered_lines if str((INSTALL_DIR / "start_tailscale.sh").resolve()) not in line]
         new_crontab = "\n".join(filtered_lines).strip()
         
         if not new_crontab: # 如果清空了所有条目
@@ -707,18 +714,21 @@ def check_status():
     embedded_cloudflare = False
     gateway_required = False
     gateway_running = True
+    tailscale_running = True
     if CONFIG_FILE.exists():
         try:
             config = json.loads(CONFIG_FILE.read_text())
             embedded_cloudflare = bool(config.get("cloudflare"))
             if embedded_cloudflare:
                 cf_running = sb_running
+            if config.get("tailscale"):
+                tailscale_running = process_running(INSTALL_DIR / "tailscaled.pid") and process_running(INSTALL_DIR / "tailscale-launcher.pid") and (INSTALL_DIR / "tailscale-ready.json").exists()
             gateway_required = bool(config.get("ssh_file"))
             gateway_running = process_running(GATEWAY_PID_FILE)
         except (OSError, ValueError, json.JSONDecodeError):
             gateway_running = False
 
-    if sb_running and cf_running and (not gateway_required or gateway_running) and LIST_FILE.exists():
+    if sb_running and cf_running and tailscale_running and (not gateway_required or gateway_running) and LIST_FILE.exists():
         print("\033[36m╭───────────────────────────────────────────────────────────────╮\033[0m")
         print("\033[36m│                \033[33m✨ ArgoSB 运行状态 ✨                    \033[36m│\033[0m")
         print("\033[36m├───────────────────────────────────────────────────────────────┤\033[0m")
@@ -757,6 +767,7 @@ def check_status():
         return True
     
     status_msgs = []
+    if not tailscale_running: status_msgs.append("Tailscale 未运行或未就绪")
     if not sb_running: status_msgs.append("sing-box 未运行")
     if gateway_required and not gateway_running: status_msgs.append("UUID 文件网关未运行")
     if not cf_running and not embedded_cloudflare: status_msgs.append("cloudflared 未运行")
@@ -797,11 +808,11 @@ def create_sing_box_config(port_vm_ws, uuid_str, tailscale=None, cloudflare=None
         "outbounds": [{"type": "direct", "tag": "direct"}]
     }
     sb_config_file = INSTALL_DIR / "sb.json"
-    if tailscale or cloudflare:
-        from tailscale_support import add_cloudflare, add_endpoint, validate_config
-        if cloudflare:
-            add_cloudflare(config_dict)
-        add_endpoint(config_dict, tailscale, INSTALL_DIR)
+    if tailscale and int(port_vm_ws) == 22:
+        raise ValueError("PORT=22 conflicts with Tailscale SSH; choose another VMess port")
+    if cloudflare:
+        from tailscale_support import add_cloudflare, validate_config
+        add_cloudflare(config_dict)
         validate_config(INSTALL_DIR / "sing-box", config_dict)
     with open(sb_config_file, 'w') as f:
         json.dump(config_dict, f, indent=2)
@@ -954,6 +965,20 @@ def create_startup_script():
             snapshot_target.unlink(missing_ok=True)
         sb_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(helper_path.resolve()))} {install_dir}"
 
+    tailscale_script = INSTALL_DIR / "start_tailscale.sh"
+    if config.get("tailscale"):
+        import tailscale_daemon
+        manager = INSTALL_DIR / "tailscale_daemon.py"
+        source = Path(tailscale_daemon.__file__).resolve()
+        if source != manager.resolve():
+            shutil.copyfile(source, manager)
+        tailscale_script.write_text(f"#!/bin/bash\ncd {install_dir}\n"
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(manager.resolve()))} {install_dir} > tailscale.log 2>&1 &\n"
+            "echo $! > tailscale-launcher.pid\n")
+        tailscale_script.chmod(0o755)
+    else:
+        tailscale_script.unlink(missing_ok=True)
+
     sb_start_script_path = INSTALL_DIR / "start_sb.sh"
     sb_start_content = f'''#!/bin/bash
 cd {install_dir}
@@ -1005,11 +1030,14 @@ echo $! > {shlex.quote(ARGO_PID_FILE.name)}
     )
 
 # Stop only processes owned by this installation before replacing them.
-def stop_managed_service(pid_file, binary):
+def stop_managed_service(pid_file, binary, script=None):
     try:
         pid = int(pid_file.read_text().strip())
         executable = Path(f"/proc/{pid}/exe").resolve()
-        if executable != binary.resolve():
+        # Atomic upgrades leave the running executable marked as deleted.
+        if Path(str(executable).removesuffix(" (deleted)")) != binary.resolve():
+            return
+        if script is not None and str(script.resolve()).encode() not in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"):
             return
         os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + 5
@@ -1022,6 +1050,13 @@ def stop_managed_service(pid_file, binary):
                 os.kill(pid, signal.SIGKILL)
     except (OSError, ValueError):
         return
+
+
+def stop_tailscale_services():
+    stop_managed_service(INSTALL_DIR / "tailscale-launcher.pid", Path(sys.executable), INSTALL_DIR / "tailscale_daemon.py")
+    stop_managed_service(INSTALL_DIR / "tailscaled.pid", INSTALL_DIR / "tailscaled")
+    for name in ("tailscale-launcher.pid", "tailscaled.pid", "tailscale-ready.json"):
+        (INSTALL_DIR / name).unlink(missing_ok=True)
 
 
 def process_running(pid_file):
@@ -1041,6 +1076,8 @@ def service_pid_files(config):
         services.append(("cloudflared", ARGO_PID_FILE))
     if config.get("ssh_file"):
         services.append(("UUID 文件网关", GATEWAY_PID_FILE))
+    if config.get("tailscale"):
+        services.append(("Tailscale launcher", INSTALL_DIR / "tailscale-launcher.pid"))
     return services
 
 
@@ -1048,12 +1085,17 @@ def service_pid_files(config):
 def start_services():
     config = json.loads(CONFIG_FILE.read_text())
     embedded_cloudflare = bool(config.get("cloudflare"))
+    if config.get("tailscale") or (INSTALL_DIR / "tailscale-launcher.pid").exists() or (INSTALL_DIR / "tailscaled.pid").exists():
+        stop_tailscale_services()
     stop_managed_service(SB_PID_FILE, INSTALL_DIR / "sing-box")
     stop_managed_service(ARGO_PID_FILE, INSTALL_DIR / "cloudflared")
     if embedded_cloudflare:
         ARGO_PID_FILE.unlink(missing_ok=True)
     print("正在启动sing-box服务...")
     subprocess.run(["bash", str(INSTALL_DIR / "start_sb.sh")], check=True)
+    if config.get("tailscale"):
+        print("Tailscale: starting independent userspace daemon; diagnostics are in tailscale.log", flush=True)
+        subprocess.run(["bash", str(INSTALL_DIR / "start_tailscale.sh")], check=True)
     gateway_script = INSTALL_DIR / "start_gateway.sh"
     if gateway_script.exists():
         print("正在启动 UUID 文件网关...")
@@ -1069,7 +1111,7 @@ def start_services():
 
     # Embedded Cloudflare may wait for four edge registrations before sing-box
     # finishes startup. Keep forwarding its logs while waiting for the listener.
-    deadline = time.monotonic() + (120 if embedded_cloudflare else 0)
+    deadline = time.monotonic() + (120 if embedded_cloudflare or config.get("tailscale") else 0)
     next_progress = time.monotonic() + 15
     ports = {int(config.get("singbox_port", config["port_vm_ws"])), int(config["gateway_port"])}
     while True:
@@ -1082,12 +1124,17 @@ def start_services():
                 probe.settimeout(1)
                 if probe.connect_ex(("127.0.0.1", port)) != 0:
                     pending.append(port)
-        if not pending:
+        tailscale_ready = (not config.get("tailscale") or (
+            (INSTALL_DIR / "tailscale-ready.json").exists() and process_running(INSTALL_DIR / "tailscaled.pid")))
+        if not pending and tailscale_ready:
             break
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"本地端口 {pending} 未监听；请检查 {INSTALL_DIR} 下的日志")
+            raise RuntimeError(f"服务尚未就绪：本地端口={pending}, Tailscale ready={tailscale_ready}；请检查 {INSTALL_DIR} 下的日志")
         if time.monotonic() >= next_progress:
-            print("Cloudflare: sing-box is still starting; check edge connection diagnostics above", flush=True)
+            if pending:
+                print("Cloudflare: sing-box is still starting; check edge connection diagnostics above", flush=True)
+            if not tailscale_ready:
+                print("Tailscale: waiting for node login/configuration; check tailscale.log", flush=True)
             next_progress = time.monotonic() + 15
         time.sleep(0.5)
     if embedded_cloudflare:

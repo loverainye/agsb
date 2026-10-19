@@ -22,7 +22,7 @@
   - [📁 文件结构](#-文件结构)
   - [✅ 优势特点](#-优势特点)
 
-- [Streamlit Upterm 自动启动](#streamlit-upterm-自动启动)
+- [Streamlit 自动启动](#streamlit-自动启动)
 
 - [🌐 Glitch 网站保活脚本](#-glitch-网站保活脚本)
   - [🔥 主要功能](#-主要功能)
@@ -438,9 +438,9 @@ cd ~ && curl -fsSL https://raw.githubusercontent.com/zhumengkang/agsb/main/agsb-
 
 ---
 
-## Streamlit Upterm 自动启动
+## Streamlit 自动启动
 
-`upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本先在后台启动 `agsb-v2.py`，再启动 Upterm；私有应用需先登录。只有 Uvicorn 日志时，先确认页面已加载。Upterm 就绪后，Streamlit Community Cloud 的应用日志会输出 `Upterm SSH connection: ssh ...`，失败时输出 `[upterm]` 诊断和退出码。连接命令不写入 TXT 文件，也不上传到第三方文件服务。
+`upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本在后台启动 `agsb-v2.py`；私有应用需先登录。只有 Uvicorn 日志时，先确认页面已加载。SSH 使用官方 Tailscale 二进制程序，启用方式和身份恢复配置见下文；应用日志会输出 `Tailscale SSH connection: ssh ...`。连接命令不写入 TXT 文件，也不上传到第三方文件服务。
 
 通过环境变量或 Streamlit Secrets 配置：
 
@@ -451,11 +451,7 @@ export AGK="your-cloudflare-tunnel-token"
 export DOMAIN="your.domain.example"
 ```
 
-默认启动的 Upterm 会话允许任何持有日志中 SSH 连接命令的人进入可写 shell。可选用 `UPTERM_AUTHORIZED_USER=github:your-username`、`UPTERM_AUTHORIZED_KEY`（一行 SSH 公钥）或 `UPTERM_AUTHORIZED_KEYS`（每行一个原始 SSH 公钥的文件路径）限制连接者。请限制 Streamlit 应用日志的访问权限。`UUID` 仅用于 sing-box，Upterm 不使用它。
-
-仓库自带 [Upterm 官方 v0.33.0](https://github.com/owenthereal/upterm/releases/tag/v0.33.0) 的 Linux x86_64 和 arm64 可执行文件，位于 `bin/`，许可证见 `bin/UPTERM-LICENSE`。启动时校验 SHA-256 并复制到 `~/upterm`，不再从网络下载；也可用 `UPTERM_BIN` 指向预装的可执行文件。容器通过 `wss://uptermd.upterm.dev` 的 443 端口连接中继，并固定官方中继主机密钥，不需要在容器内运行 `sshd`。日志直接输出 `ssh 用户名@uptermd.upterm.dev`，连接端只需 SSH 客户端且须能访问中继的 TCP 22 端口。Streamlit 重跑时会查询并重用已有会话；授权配置改变时会停止旧会话并建立新会话。
-
-Streamlit 默认使用 sing-box 内置的 `cloudflared` 入站，Cloudflare Tunnel、VMess 和可选的 Tailscale SSH 共用同一个 sing-box 进程。隧道继续从 `AGK` 获取 token；`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname；Upterm 公共中继不经过这个域名或端口。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`（例如 `PORT=19999` 时为 `http://localhost:19999`），路径规则可以保持 `*`。token 只连接已有的远程管理隧道，不会自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。
+Streamlit 默认使用 sing-box 内置的 `cloudflared` 入站，Cloudflare Tunnel 和 VMess 共用同一个 sing-box 进程；可选的 Tailscale 由独立 `tailscaled` 提供。隧道继续从 `AGK` 获取 token；`PORT` 是 sing-box 本地端口（未设置时默认 `49999`），`DOMAIN` 是 Cloudflare 的 Public Hostname。在 Cloudflare Zero Trust 中将现有 `DOMAIN` 路由保持为 `http://localhost:PORT`（例如 `PORT=19999` 时为 `http://localhost:19999`），路径规则可以保持 `*`。token 只连接已有的远程管理隧道，不会自动创建或修改 Public Hostname 路由。Streamlit 启动不修改 crontab。
 
 内置隧道要求 sing-box ≥ 1.14.0 且包含 `with_cloudflared`，启动前会检查版本、编译标签和配置。默认自动选择协议，先尝试 QUIC，必要时回退到 HTTP/2；使用容器 DNS 解析控制服务、边缘节点和源站。`AGK` 仅在启动时注入匿名配置输入，不写进 `sb.json`、启动脚本或命令行，也会从 sing-box 子进程环境中移除。应用重跑会复用配置相同的进程；token、域名或 Tailscale 配置改变时重新启动。迁移时停止本安装目录中旧的独立 cloudflared，之后不再下载或启动该进程。
 
@@ -463,27 +459,75 @@ Streamlit 应用日志持续显示 `Cloudflare:` 启动进度以及 `inbound/clo
 
 直接使用仓库中的安装脚本时，可通过 `python3 agsb-v2.py install --embedded-cloudflare --no-autostart --uuid "$UUID" --port "$PORT" --domain "$DOMAIN"` 启用同样的内置模式，运行和重启时需注入 `AGK`。不加此参数时保留原来的独立 cloudflared 和 Quick Tunnel 安装方式。
 
-### 可选：在现有 sing-box 中启用 Tailscale SSH
+### 可选：官方 Tailscale SSH、出口节点和 App Connector
 
 在上述配置之外注入环境变量（或 Streamlit Secrets 顶层字段）：
 
 ```bash
 export TAILSCALE_AUTH_KEY="tskey-auth-..."
-export TAILSCALE_HOSTNAME="streamlit-agsb"  # 可选，默认 agsb-UUID前8位
-export TAILSCALE_EPHEMERAL="true"          # 可选，默认 true
+export TAILSCALE_HOSTNAME="streamlit-agsb"  # 可选；恢复快照时默认使用快照中的名称
+export TAILSCALE_EPHEMERAL="false"         # 复用节点身份；全新注册默认 true
+export TAILSCALE_ADVERTISE_TAGS="tag:app-connector"  # 可选，须先配置 tagOwners
 ```
 
-设置 `TAILSCALE_AUTH_KEY` 后，安装脚本将 `tailscale` endpoint 和 `ssh_server: true` 加入现有 `sb.json`，使用同一个 sing-box 进程；Upterm 继续启动。要求 sing-box ≥ 1.14.0 且包含 `with_tailscale`，启动前会检查版本和配置。endpoint 使用用户态网络，无需 root、TUN 设备或额外的 tailscaled/sshd。VMess 继续使用 direct 出站；Tailscale 同时提供内置 SSH 和 VMess 端口转发。
+设置 `TAILSCALE_AUTH_KEY` 或下文的 `TAILSCALE_STATE_KEY` 后，安装脚本从 `pkgs.tailscale.com` 下载固定版本 **1.104.1** 的官方 `tailscale` / `tailscaled`，校验归档 SHA-256 后安装到 `~/.agsb/`，支持 Linux amd64、arm64；已安装且校验通过时复用。Tailscale 不再使用 sing-box endpoint，也不要求 sing-box 包含 `with_tailscale`。
 
-启用 Tailscale 后，节点自身 Tailscale IP 的 TCP `$PORT` 会转发至 `127.0.0.1:$PORT` 的 VMess/WebSocket 入站，兼容节点的 Tailscale IPv4 和 IPv6 地址；VMess 仍监听回环地址。转发规则只允许这个 TCP 端口，其余未被内置 SSH 等服务处理的流量仍拒绝。`PORT=22` 会与 SSH 冲突，需选择其他端口。升级前已运行的 SSH 配置会在应用下次执行时重新生成并重启，节点状态目录保留。
+`tailscaled` 独立运行在 `--tun=userspace-networking` 模式，使用私有 Unix socket 和原来的 `~/.agsb/tailscale/` 身份目录，无需 root、TUN 或 systemd。启动器启用以下偏好：
 
-本地运行 daed 或其他代理客户端的机器先接入同一个 tailnet，并在 Tailscale ACL/grants 中允许到节点的 TCP `$PORT`。节点配置使用：服务器为控制台显示的 Tailscale IP（或可解析的 MagicDNS 名称），端口为 `$PORT`，协议为 VMess，UUID 不变，WebSocket 路径为 `/UUID前8位-vm`，关闭 TLS，传输由 Tailscale 加密。确保到 Tailscale IP 的底层连接走 Tailscale 网络。Cloudflare 隧道同时保留，原来的域名节点继续使用各自的 TLS/端口配置。应用日志会输出 `Tailscale VMess:` 参数和端口转发信息。
+```bash
+# 由启动器设置；不要另起一个使用相同身份的 tailscaled。
+"$HOME/.agsb/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set \
+  --advertise-connector --ssh --accept-dns=false --accept-routes=false \
+  --hostname=streamlit-agsb
+# 未宣告出口路由时再设置一次；以后保留 App Connector 已学习的路由。
+"$HOME/.agsb/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set --advertise-exit-node
+```
 
-Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-box 的标准输入传入；不会写进 `sb.json`、启动脚本或命令行。节点身份保存在 `~/.agsb/tailscale/`。Streamlit Community Cloud 实测 Reboot 后，包含 `/mount/src` 在内的候选目录均未保留测试文件，因此本地路径不能保证跨重建保留身份。
+可通过节点 Tailscale IPv4/IPv6 的 TCP `$PORT` 访问 `127.0.0.1:$PORT` 的 VMess/WebSocket 入站。官方用户态网络自动完成本机 TCP 转发，`sb.json` 不再包含 Tailscale 转发规则。VMess 继续监听回环地址，`PORT=22` 会与 Tailscale SSH 冲突。普通用户运行的 Tailscale SSH 登录为该进程用户，Streamlit 中通常为 `appuser`。
+
+**到节点其他本机服务端口的访问由 Tailscale ACL/grants 控制。** 旧版 sing-box 的私网拒绝规则不再处理 Tailscale 流量；请在 tailnet 策略中明确允许所需端口，例如 TCP 22、`$PORT`，以及 App Connector 的 TCP/UDP 53。
+
+#### 启用按域名分流
+
+`--advertise-connector` 只让节点具备 App Connector 能力。还需在 Tailscale 管理端：
+
+1. 定义 `tag:app-connector` 的 `tagOwners`，给节点分配该标签。可以使用上述 `TAILSCALE_ADVERTISE_TAGS`，也可以在管理控制台手动分配；未设置变量时保留已有标签。
+2. 在 **Apps** 中添加要分流的应用/域名，并选择该连接器；也可配置策略中的 `nodeAttrs`。
+3. 配置路由自动批准和流量 grants。参见 [App Connector 策略示例](examples/tailscale-app-connector-policy.example.jsonc)，将示例片段合并到自己的策略。
+4. 客户端启用 Tailscale DNS 和接受路由，并取消全局出口节点：
+
+```bash
+sudo tailscale set --exit-node= --accept-routes=true --accept-dns=true
+```
+
+匹配应用域名的 DNS 查询让连接器学习并宣告目标 IP 路由，客户端再通过连接器访问这些 IP；其他流量继续使用本地网络。多个域名共用同一 IP 时，也可能一起走连接器。客户端绕过 Tailscale DNS 的独立 DoH 配置可能影响域名学习。详见 [官方 App Connector 配置说明](https://tailscale.com/docs/features/app-connectors/how-to/setup)。
+
+#### Android 客户端
+
+服务端标签、应用域名和路由授权配置完成后，在 Android 上安装官方 Tailscale，登录同一 tailnet 并开启连接。Android 默认接受子网路由，无需执行 Linux 的 `tailscale set` 命令，也无需在手机上宣告连接器。
+
+在客户端将 **Exit node / 出口节点** 设为 **None / 无**，并保持 **Use Tailscale DNS settings** 启用；若版本提供 **Use Tailscale subnets / 接受子网路由** 开关，也应保持启用。要让普通应用使用此分流路径，不要在 Tailscale 的应用排除设置中排除它们。此方案直接使用 Tailscale VPN，无需导入 VMess 节点。
+
+测试时直接打开策略中配置的应用或网站；其他目标继续走手机原有网络。若域名学习没有触发，先关闭浏览器的独立安全 DNS/DoH，将 Android 私人 DNS 改为自动或关闭，再重新连接 Tailscale、重启被测应用。Android 通常只能同时使用一个 VPN，测试时停用其他代理 VPN。客户端偏好参见 [Tailscale 官方说明](https://tailscale.com/docs/features/client/manage-preferences)。
+
+#### 使用全局出口或 VMess
+
+出口节点仍需在 [Tailscale 管理控制台](https://login.tailscale.com/admin/machines) 的路由设置中批准 **Use as exit node**，并在客户端选择它：
+
+```bash
+sudo tailscale set --exit-node=100.122.80.77  # 替换为控制台显示的节点 IP
+sudo tailscale set --exit-node=             # 取消全局出口
+```
+
+自定义策略需允许客户端访问 `autogroup:internet`。选中出口后，TCP/UDP 上网流量经 Tailscale 和容器网络出站，无需 VMess。IPv6 公网出口取决于容器本身的 IPv6 出网能力。
+
+使用 daed 等代理客户端时，机器先加入同一 tailnet。VMess 服务器填节点 Tailscale IP 或 MagicDNS 名称，端口填 `$PORT`，UUID 不变，WebSocket 路径为 `/UUID前8位-vm`，关闭 TLS；Tailscale 提供链路加密。Cloudflare 域名节点仍按原配置连接。
+
+Auth Key 仅在需要登录时从环境变量读取，通过 `tailscale up --auth-key=file:/dev/stdin` 的标准输入传递，不写入配置、脚本或命令行。已恢复身份不重复使用 Auth Key 注册。密钥及继承的 `SUDO_*` 变量会从二进制子进程环境移除。临时模式使用 `--state=mem:`；持久模式使用原来的 `tailscaled.state`，迁移时不删除身份，并把旧 SSH 主机密钥复制到官方 `ssh/` 目录以保留指纹。
 
 #### 从仓库中的加密快照恢复节点
 
-仓库中的 `tailscale-state.enc` 是 AES-256-GCM 加密身份快照，包含 `tailscaled.state` 和 SSH 主机密钥，不包含日志、缓存或 Taildrop 文件。加密密钥单独放到 Streamlit Secrets 顶层字段：
+仓库中的 `tailscale-state.enc` 是 AES-256-GCM 加密身份快照，包含 `tailscaled.state` 和 SSH 主机密钥（兼容旧版根目录密钥和官方 `ssh/` 子目录），不包含日志、缓存或 Taildrop 文件。加密密钥单独放到 Streamlit Secrets 顶层字段：
 
 ```toml
 TAILSCALE_STATE_KEY = "单独保存的32字节base64url加密密钥"
@@ -491,7 +535,7 @@ TAILSCALE_HOSTNAME = "streamlit-agsb"
 TAILSCALE_EPHEMERAL = "false"
 ```
 
-启动前验证并解密快照，恢复到 `~/.agsb/tailscale/`；目录权限为 `0700`，身份文件为 `0600`。本地已有同一身份时保留较新的本地状态。密钥缺失、密文被篡改或本地身份冲突时停止启动，不自动回退注册新节点。密钥不写入配置、启动脚本或命令行，并从 sing-box 环境中移除；`requirements.txt` 提供 `cryptography` 加密依赖。
+启动前验证并解密快照，恢复到 `~/.agsb/tailscale/`；目录权限为 `0700`，身份文件为 `0600`。本地已有同一身份时保留较新的本地状态。密钥缺失、密文被篡改或本地身份冲突时停止启动，不自动回退注册新节点。密钥不写入配置、启动脚本或命令行，并从服务二进制子进程环境中移除；`requirements.txt` 提供 `cryptography` 加密依赖。
 
 恢复模式默认使用快照中的 hostname，并关闭临时节点；可只配置 `TAILSCALE_STATE_KEY` 来恢复已有节点，不必用 Auth Key 注册。若仍保留 `TAILSCALE_AUTH_KEY`，它必须对应非临时节点。**现有节点如果在 Tailscale 控制台中仍为 Ephemeral，仅将配置改成 `false` 不能保证它不被服务端自动清理**；需要先完成非临时节点注册，再导出最终身份快照。不要同时运行使用同一份身份快照的多个实例。
 
@@ -504,15 +548,13 @@ python3 tailscale_state.py export --state-dir "$HOME/.agsb/tailscale" \
 # 新建快照时可用 python3 tailscale_state.py keygen 生成独立密钥。
 ```
 
-仅把生成的 `.enc` 文件放入仓库。Tailscale 后台删除或过期的节点、过时快照均不能保证恢复原 IP；加密快照不会绕过控制台认证状态。未启用加密快照的部署仍可使用 Auth Key 注册临时节点，移除所有 Tailscale 密钥后，下次执行会生成不含该 endpoint 的配置。
+仅把生成的 `.enc` 文件放入仓库。Tailscale 后台删除或过期的节点、过时快照均不能保证恢复原 IP；加密快照不会绕过控制台认证状态。未启用加密快照的部署仍可使用 Auth Key 注册临时节点，移除所有 Tailscale 密钥后，下次执行会停止独立 Tailscale 服务。
 
-完整配置及逐项注释见 [Tailscale 代理配置示例](examples/sb.tailscale-proxy.example.jsonc)。入口标签统一为 `tailscale-proxy`，其作用是标识整个 Tailscale 入口；`ssh_server: true` 单独控制 SSH。示例同时保留内置 Cloudflare 隧道，演示端口为 `19999`。示例中的 UUID 和密钥占位符需替换；项目启动器会从环境变量注入密钥，sing-box 本身不会展开环境变量。旧入口标签的配置会在应用下次执行时重新生成。
+sing-box 配置及注释见 [代理配置示例](examples/sb.tailscale-proxy.example.jsonc)，其中只保留 VMess 和内置 Cloudflare Tunnel；Tailscale 参数由独立启动器管理。
 
-Streamlit 应用日志会显示 `Tailscale:` 启动信息、`endpoint/tailscale[tailscale-proxy]` 注册诊断，以及 `Tailscale SSH connection: ssh appuser@streamlit-agsb`。用户名从当前运行用户获取；此命令输出时节点可能仍在注册，先在 Tailscale 控制台确认节点在线。详细原始日志位于 `~/.agsb/sb.log`。日志持续转发由一个后台线程完成，不增加服务进程。
+应用日志持续转发 `~/.agsb/tailscale.log` 中的启动、认证、连接器诊断及 `Tailscale SSH connection: ssh ...` 命令。完整代理和隧道日志位于 `~/.agsb/sb.log`。节点在线、配置完成后才输出就绪标记；认证或子进程失败会显示错误，应用下次执行时重新尝试启动。
 
-启动前由应用用户创建 `~/.agsb/tailscale/` 和其中的 `taildrop/`，权限均为 `0700`，并显式指定 `taildrop_directory`。同时清除 sing-box 子进程继承的 `SUDO_USER`、`SUDO_UID`、`SUDO_GID` 等变量，让目录和 SSH 主机密钥归属当前应用用户，避免 Streamlit 容器因 `chown: operation not permitted` 退出。
-
-连接电脑先登录同一个 tailnet，启用 MagicDNS，并在 Tailscale 策略中允许到该节点的 TCP 22 和 SSH 登录到日志中的用户（Streamlit 通常为 `appuser`）。然后直接执行日志中的 `ssh ...` 命令。若 Auth Key 带设备标签，SSH 策略的 `dst` 应使用对应标签；默认的 `autogroup:self` 规则可能不适用于标签节点。实际节点名出现重名后缀时，以控制台中的 MagicDNS 名称或 Tailscale IP 为准。详见 [Tailscale SSH 策略](https://tailscale.com/kb/1193/tailscale-ssh) 和 [sing-box Tailscale endpoint](https://sing-box.sagernet.org/zh/configuration/endpoint/tailscale/)。
+连接电脑先登录同一 tailnet，启用 MagicDNS，并在策略中允许 TCP 22 及 SSH 登录到日志中的用户，再执行 `ssh appuser@streamlit-agsb`（或使用控制台显示的 IP）。连接器是标签节点，SSH 策略的 `dst` 应使用对应标签；`autogroup:self` 可能不适用。实际名称有重名后缀时，以控制台或日志中的完整 DNS 名称为准。详见 [Tailscale SSH 策略](https://tailscale.com/kb/1193/tailscale-ssh)。
 
 ## 🌐 Glitch 网站保活脚本
 

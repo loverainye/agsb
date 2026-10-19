@@ -39,6 +39,12 @@ class TailscaleTests(unittest.TestCase):
         self.assertIsNone(tailscale.settings_from_env(UUID, {}))
         settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
         self.assertTrue(settings["ephemeral"])
+        self.assertTrue(settings["advertise_exit_node"])
+        self.assertTrue(settings["advertise_connector"])
+        tagged = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY, "TAILSCALE_ADVERTISE_TAGS": "tag:app-connector,tag:app-connector"})
+        self.assertEqual(tagged["advertise_tags"], ["tag:app-connector"])
+        with self.assertRaises(ValueError):
+            tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY, "TAILSCALE_ADVERTISE_TAGS": "invalid"})
         self.assertEqual(settings["hostname"], "agsb-123e4567")
         self.assertNotIn(KEY, json.dumps(settings))
         changed = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY + "-new"})
@@ -48,93 +54,28 @@ class TailscaleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY, "TAILSCALE_EPHEMERAL": "invalid"})
 
-    def test_generated_config_preserves_vmess_and_excludes_key(self):
+    def test_generated_config_has_no_embedded_tailscale_and_tracks_port(self):
         installer = load_script("installer_tailscale", "agsb-v2.py")
-        with tempfile.TemporaryDirectory() as directory:
-            installer.INSTALL_DIR = Path(directory)
-            installer.DEBUG_LOG = Path(directory) / "debug.log"
-            installer.create_sing_box_config(19999, UUID)
-            vanilla = json.loads((Path(directory) / "sb.json").read_text())
-            self.assertNotIn("endpoints", vanilla)
-            settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
-            with patch.object(tailscale, "validate_config") as validate:
-                installer.create_sing_box_config(19999, UUID, tailscale=settings)
-                validate.assert_called_once()
-            config = json.loads((Path(directory) / "sb.json").read_text())
-            self.assertEqual(config["inbounds"], vanilla["inbounds"])
-            self.assertEqual(config["outbounds"], vanilla["outbounds"])
-            self.assertEqual(config["route"]["final"], "direct")
-            self.assertTrue(config["endpoints"][0]["ssh_server"])
-            self.assertFalse(config["endpoints"][0]["system_interface"])
-            self.assertNotIn(KEY, json.dumps(config))
-            self.assertEqual((Path(directory) / "tailscale").stat().st_mode & 0o777, 0o700)
-            taildrop = Path(config["endpoints"][0]["taildrop_directory"])
-            self.assertEqual(taildrop, Path(directory) / "tailscale" / "taildrop")
-            self.assertEqual(taildrop.stat().st_mode & 0o777, 0o700)
-            runtime = json.loads(tailscale.runtime_config(config, {"TAILSCALE_AUTH_KEY": KEY}))
-            self.assertEqual(runtime["endpoints"][0]["auth_key"], KEY)
-            self.assertNotIn("auth_key", config["endpoints"][0])
-            with self.assertRaises(ValueError):
-                tailscale.runtime_config(config, {})
-
-    def test_existing_endpoint_keeps_runtime_auth_during_tag_upgrade(self):
-        config = {
-            "endpoints": [{"type": "tailscale", "tag": "tailscale-ssh"}],
-            "route": {"rules": [{"inbound": ["tailscale-ssh"], "action": "reject"}]},
-        }
-        runtime = json.loads(tailscale.runtime_config(config, {"TAILSCALE_AUTH_KEY": KEY}))
-        self.assertEqual(runtime["endpoints"][0]["auth_key"], KEY)
-        self.assertEqual(runtime["route"], config["route"])
-        self.assertNotIn("auth_key", config["endpoints"][0])
-
-    def test_preflight_uses_stdin_and_redacts_validation_errors(self):
-        config = {"endpoints": [{"tag": tailscale.TAILSCALE_TAG}]}
-        binary = Path("/tmp/test-sing-box")
-        version = subprocess.CompletedProcess([], 0, "sing-box version 1.14.3\nTags: with_tailscale\n", "")
-        checked = subprocess.CompletedProcess([], 1, "", "invalid auth " + KEY)
-        with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY, "SUDO_UID": "12345", "SUDO_GID": "12345", "SUDO_USER": "other-user"}, clear=True):
-            with patch.object(tailscale.subprocess, "run", side_effect=[version, checked]) as run:
-                with self.assertRaises(RuntimeError) as error:
-                    tailscale.validate_config(binary, config)
-                self.assertNotIn(KEY, str(error.exception))
-                self.assertEqual(json.loads(run.call_args.kwargs["input"])["endpoints"][0]["auth_key"], KEY)
-                self.assertNotIn(KEY, str(run.call_args.args))
-                for call in run.call_args_list:
-                    for name in ("TAILSCALE_AUTH_KEY", "SUDO_UID", "SUDO_GID", "SUDO_USER"):
-                        self.assertNotIn(name, call.kwargs["env"])
-        for output in ("sing-box version 1.13.0\nTags: with_tailscale", "sing-box version 1.14.3\nTags: with_gvisor"):
-            with patch.object(tailscale.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
-                with self.assertRaises(RuntimeError):
-                    tailscale.validate_config(binary, config)
-                self.assertEqual(run.call_count, 1)
-
-    def test_proxy_forwarding_tracks_port_and_preserves_cloudflare_and_ssh(self):
-        installer = load_script("installer_tailscale_forwarding", "agsb-v2.py")
         settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
         with tempfile.TemporaryDirectory() as directory:
             installer.INSTALL_DIR = Path(directory)
             installer.DEBUG_LOG = Path(directory) / "debug.log"
             for port in (19999, 21111):
                 with patch.object(tailscale, "validate_config"):
-                    installer.create_sing_box_config(
-                        port, UUID, tailscale=settings,
-                        cloudflare=tailscale.cloudflare_settings("test-token"),
-                    )
+                    installer.create_sing_box_config(port, UUID, tailscale=settings,
+                        cloudflare=tailscale.cloudflare_settings("test-token"))
                 config = json.loads((Path(directory) / "sb.json").read_text())
-                rules = config["route"]["rules"]
-                forwarded = [rule for rule in rules if rule.get("inbound") == [tailscale.TAILSCALE_TAG] and rule["action"] == "route"]
-                self.assertEqual(len(forwarded), 1)
-                rule = forwarded[0]
-                self.assertEqual(rule["port"], [port])
-                self.assertEqual(rule["network"], "tcp")
-                self.assertEqual(set(rule["ip_cidr"]), {"127.0.0.1/32", "::1/128"})
-                self.assertEqual((rule["outbound"], rule["override_address"], rule["override_port"]), ("direct", "127.0.0.1", port))
-                reject = {"inbound": [tailscale.TAILSCALE_TAG], "action": "reject"}
-                self.assertLess(rules.index(rule), rules.index(reject))
-                self.assertIn({"inbound": [tailscale.CLOUDFLARE_TAG], "action": "route", "outbound": "direct"}, rules)
+                self.assertNotIn("endpoints", config)
                 self.assertEqual(config["inbounds"][0]["listen"], "127.0.0.1")
-                self.assertTrue(config["endpoints"][0]["ssh_server"])
-                self.assertFalse(config["endpoints"][0]["system_interface"])
+                self.assertEqual(config["inbounds"][0]["listen_port"], port)
+                self.assertEqual(config["route"]["rules"], [{
+                    "inbound": [tailscale.CLOUDFLARE_TAG], "action": "route", "outbound": "direct",
+                }])
+                self.assertNotIn(KEY, json.dumps(config))
+
+    def test_legacy_endpoint_requires_regeneration(self):
+        with self.assertRaisesRegex(ValueError, "regenerated"):
+            tailscale.runtime_config({"endpoints": [{"type": "tailscale"}]}, {})
 
     def test_ssh_port_conflict_does_not_replace_existing_configuration(self):
         installer = load_script("installer_tailscale_port_conflict", "agsb-v2.py")
@@ -148,72 +89,29 @@ class TailscaleTests(unittest.TestCase):
                 installer.create_sing_box_config(22, UUID, tailscale=settings)
             self.assertEqual((Path(directory) / "sb.json").read_text(), original)
 
-    def test_startup_exec_keeps_pid_and_credentials_stay_in_stdin(self):
-        installer = load_script("installer_exec", "agsb-v2.py")
+    def test_standalone_launcher_install_and_disable(self):
+        installer = load_script("installer_launcher", "agsb-v2.py")
         with tempfile.TemporaryDirectory(prefix="agsb test ") as directory:
-            state = Path(directory)
-            installer.INSTALL_DIR = state
-            installer.CONFIG_FILE = state / "config.json"
-            installer.SB_PID_FILE = state / "sbpid.log"
-            installer.ARGO_PID_FILE = state / "sbargopid.log"
-            installer.TUNNEL_TOKEN_FILE = state / "tunnel_token"
-            installer.DEBUG_LOG = state / "debug.log"
-            installer.LOG_FILE = state / "argo.log"
+            root = Path(directory)
+            installer.INSTALL_DIR = root
+            installer.CONFIG_FILE = root / "config.json"
+            installer.TUNNEL_TOKEN_FILE = root / "tunnel_token"
+            installer.DEBUG_LOG = root / "debug.log"
             settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
-            config = {"log": {"level": "info"}}
-            tailscale.add_endpoint(config, settings, state)
-            template = json.dumps(config)
-            (state / "sb.json").write_text(template)
-            # Reproduce directories missing at startup after config generation.
-            shutil.rmtree(state / "tailscale")
-            installer.CONFIG_FILE.write_text(json.dumps({"port_vm_ws": 19999, "tailscale": settings}))
+            config = {"port_vm_ws": 19999, "tailscale": settings}
+            installer.CONFIG_FILE.write_text(json.dumps(config))
             installer.create_startup_script()
-            script = (state / "start_sb.sh").read_text()
-            self.assertNotIn(KEY, script)
-            self.assertEqual(subprocess.run(["bash", "-n", str(state / "start_sb.sh")]).returncode, 0)
-            # A substitute executable reports its input and PID, without a tailnet login.
-            binary = state / "sing-box"
-            binary.write_text(f"#!{sys.executable}\nimport os,sys,json\nprint(json.dumps({{'pid':os.getpid(),'args':sys.argv[1:],'key_env':os.getenv('TAILSCALE_AUTH_KEY'),'sudo_env':{{name:os.getenv(name) for name in ['SUDO_UID','SUDO_GID','SUDO_USER','SUDO_COMMAND']}},'config':json.load(sys.stdin)}}))\n")
-            binary.chmod(0o755)
-            env = os.environ.copy()
-            env["TAILSCALE_AUTH_KEY"] = KEY
-            env.update(SUDO_UID="12345", SUDO_GID="12345", SUDO_USER="other-user", SUDO_COMMAND="bootstrap")
-            process = subprocess.Popen(
-                [sys.executable, str(state / "tailscale_support.py"), directory],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-            )
-            stdout, stderr = process.communicate(timeout=10)
-            self.assertEqual(process.returncode, 0, stderr)
-            reported = json.loads(stdout.splitlines()[-1])
-            self.assertEqual(reported["pid"], process.pid)
-            self.assertEqual(reported["args"], ["run", "-c", "stdin"])
-            self.assertIsNone(reported["key_env"])
-            self.assertTrue(all(value is None for value in reported["sudo_env"].values()))
-            self.assertEqual(reported["config"]["endpoints"][0]["auth_key"], KEY)
-            for name in ("state_directory", "taildrop_directory"):
-                path = Path(reported["config"]["endpoints"][0][name])
-                self.assertTrue(path.is_dir())
-                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
-            self.assertEqual((state / "sb.json").read_text(), template)
-            self.assertIn("Tailscale SSH connection: ssh", stdout)
-            self.assertNotIn(KEY, "\n".join(stdout.splitlines()[:-1]))
-
-    def test_legacy_config_prepares_taildrop_without_changing_owner(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory)
-            node_dir = state / "tailscale"
-            node_dir.mkdir()
-            identity = node_dir / "tailscaled.state"
-            identity.write_text("existing-node-identity")
-            endpoint = {"tag": tailscale.TAILSCALE_TAG, "state_directory": str(node_dir)}
-            with patch.object(tailscale.os, "chown", side_effect=PermissionError("operation not permitted")) as chown:
-                tailscale.prepare_endpoint_directories(endpoint, state)
-                # The same paths are safe to reuse on every application restart.
-                tailscale.prepare_endpoint_directories(endpoint, state)
-                chown.assert_not_called()
-            self.assertEqual(identity.read_text(), "existing-node-identity")
-            self.assertEqual(Path(endpoint["taildrop_directory"]), node_dir / "taildrop")
-            self.assertEqual((node_dir / "taildrop").stat().st_mode & 0o777, 0o700)
+            for name in ("start_sb.sh", "start_tailscale.sh"):
+                script = root / name
+                self.assertNotIn(KEY, script.read_text())
+                self.assertEqual(subprocess.run(["bash", "-n", str(script)]).returncode, 0)
+            for name in ("tailscale_daemon.py", "tailscale_support.py", "tailscale_state.py"):
+                self.assertTrue((root / name).is_file())
+            self.assertIn("tailscale.log", (root / "start_tailscale.sh").read_text())
+            config["tailscale"] = None
+            installer.CONFIG_FILE.write_text(json.dumps(config))
+            installer.create_startup_script()
+            self.assertFalse((root / "start_tailscale.sh").exists())
 
     def test_running_proxy_is_reconfigured_for_enable_change_and_disable(self):
         launcher = load_script("launcher_tailscale", "upload-yuancheng.py")
@@ -226,19 +124,21 @@ class TailscaleTests(unittest.TestCase):
                 "uuid_str": UUID, "port_vm_ws": 19999, "custom_domain_agn": "example.test",
                 "cloudflare": tailscale.cloudflare_settings(settings["agk"]),
             }
-            for filename in ("sbpid.log", "sbargopid.log"):
+            for filename in ("sbpid.log", "tailscaled.pid", "tailscale-launcher.pid"):
                 (state / filename).write_text("12345")
             with patch.object(launcher, "_is_running", return_value=True):
                 with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True):
                     (state / "config.json").write_text(json.dumps(config))
                     self.assertFalse(launcher._installer_already_started(settings))
                     config["tailscale"] = tailscale.settings_from_env(UUID)
-                    for field in ("proxy_forwarding", "endpoint_tag"):
+                    for field in ("implementation", "advertise_connector", "advertise_exit_node"):
                         value = config["tailscale"].pop(field)
                         (state / "config.json").write_text(json.dumps(config))
                         self.assertFalse(launcher._installer_already_started(settings))
                         config["tailscale"][field] = value
                     (state / "config.json").write_text(json.dumps(config))
+                    self.assertFalse(launcher._installer_already_started(settings))
+                    (state / "tailscale-ready.json").write_text(json.dumps({"settings": config["tailscale"], "port": 19999}))
                     self.assertTrue(launcher._installer_already_started(settings))
                     with patch.dict(os.environ, {"TAILSCALE_HOSTNAME": "other-host"}):
                         self.assertFalse(launcher._installer_already_started(settings))
@@ -266,7 +166,7 @@ class TailscaleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             installer_log = state / "launcher.log"
-            sb_log = state / "sb.log"
+            sb_log = state / "tailscale.log"
             installer_log.write_text("Tailscale: old message\n")
             sb_log.write_text("")
             relay = tailscale._LogRelay(state, installer_log)
@@ -274,7 +174,7 @@ class TailscaleTests(unittest.TestCase):
             with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), contextlib.redirect_stdout(captured):
                 with installer_log.open("a") as stream:
                     stream.write("Tailscale: configuring\n")
-                sb_log.write_text(f"DEBUG endpoint/tailscale[{tailscale.TAILSCALE_TAG}]: auth " + KEY)
+                sb_log.write_text("DEBUG tailscaled: auth " + KEY)
                 relay.poll()
                 self.assertNotIn("auth", captured.getvalue())
                 with sb_log.open("a") as stream:
@@ -282,14 +182,14 @@ class TailscaleTests(unittest.TestCase):
                 relay.poll()
                 relay.poll()
                 sb_log.write_text("Tailscale SSH connection: ssh appuser@agsb-test\n")
-                (state / "sbpid.log").write_text("12345")
+                (state / "tailscale-launcher.pid").write_text("12345")
                 relay.poll()
             output = captured.getvalue()
             self.assertIn("configuring", output)
             self.assertIn("ssh appuser@agsb-test", output)
             self.assertEqual(output.count("[redacted]"), 1)
             self.assertNotIn(KEY, output)
-            self.assertNotIn("ordinary proxy", output)
+            self.assertIn("ordinary proxy", output)
             self.assertNotIn("old message", output)
 
     def test_service_replacement_stops_only_installation_owned_binary(self):
@@ -297,22 +197,29 @@ class TailscaleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             binary = state / "sing-box"
-            shutil.copyfile(sys.executable, binary)
+            shutil.copyfile(shutil.which("sleep"), binary)
             binary.chmod(0o755)
             pid_file = state / "sbpid.log"
-            process = subprocess.Popen([str(binary), "-c", "import time; time.sleep(30)"])
+            process = subprocess.Popen(["sleep", "30"], executable=str(binary))
             try:
                 pid_file.write_text(str(process.pid))
                 for _ in range(50):
                     if Path(f"/proc/{process.pid}/exe").resolve() == binary:
                         break
                     time.sleep(0.01)
+                # Reproduce an atomic binary upgrade while the old inode runs.
+                replacement = state / "replacement"
+                shutil.copyfile(binary, replacement)
+                replacement.chmod(0o755)
+                replacement.replace(binary)
+                self.assertIsNone(process.poll())
                 installer.stop_managed_service(pid_file, binary)
                 process.wait(timeout=3)
                 self.assertNotEqual(process.returncode, 0)
                 pid_file.write_text(str(os.getpid()))
                 with patch.object(installer.os, "kill") as kill:
                     installer.stop_managed_service(pid_file, binary)
+                    installer.stop_managed_service(pid_file, Path(sys.executable), state / "unrelated.py")
                     kill.assert_not_called()
             finally:
                 if process.poll() is None:

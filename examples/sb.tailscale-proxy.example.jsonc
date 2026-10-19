@@ -1,7 +1,8 @@
-// sing-box >= 1.14.0，需包含 with_tailscale 和 with_cloudflared。
+// sing-box >= 1.14.0，需包含 with_cloudflared。
+// Tailscale 使用独立官方 tailscaled，不在此 JSON 中配置。
 // 完整示例：PORT=19999，UUID 为演示值，WS 路径使用 UUID 前 8 位。
-// 项目启动器从环境变量注入 auth_key/token；手动运行须替换对应占位符。
-// sing-box 不会自动展开环境变量。项目生成的 sb.json 不保存这两个密钥。
+// 项目启动器从 AGK 注入 token；手动运行须替换 token 占位符。
+// sing-box 不会自动展开环境变量。项目生成的 sb.json 不保存 token。
 {
   "log": {
     "level": "debug",
@@ -15,7 +16,7 @@
   },
   "inbounds": [
     {
-      // VMess 服务：接收来自 Tailscale 转发或 Cloudflare 隧道的连接。
+      // VMess 服务：接收来自 tailscaled 用户态网络或 Cloudflare 隧道的连接。
       "type": "vmess",
       "tag": "vmess-in",
       "listen": "127.0.0.1",
@@ -39,24 +40,6 @@
       "token": "<AGK>"
     }
   ],
-  "endpoints": [
-    {
-      // tag 标识整个 Tailscale 入口，供 route.rules 引用。
-      "type": "tailscale",
-      "tag": "tailscale-proxy",
-      "hostname": "streamlit-agsb",
-      "auth_key": "<TAILSCALE_AUTH_KEY>",
-      // 复用加密身份时关闭临时节点；临时节点离线后会自动清理。
-      "ephemeral": false,
-      // 用户态网络，适用于没有 root/TUN 权限的 Streamlit 容器。
-      "system_interface": false,
-      // 独立开启内置 SSH：通过 Tailscale IP 的 22 端口登录。
-      "ssh_server": true,
-      // 启动器提前创建目录并设置 0700 权限，以保留节点身份。
-      "state_directory": "/home/appuser/.agsb/tailscale",
-      "taildrop_directory": "/home/appuser/.agsb/tailscale/taildrop"
-    }
-  ],
   "outbounds": [
     { "type": "direct", "tag": "direct" }
   ],
@@ -68,24 +51,6 @@
         "inbound": ["cloudflare-tunnel"],
         "action": "route",
         "outbound": "direct"
-      },
-      {
-        // Tailscale 端点将访问自身 Tailscale IP 的目标转换为回环地址。
-        "inbound": ["tailscale-proxy"],
-        "network": "tcp",
-        "ip_cidr": ["127.0.0.1/32", "::1/128"],
-        "port": [19999],
-        // 把 Tailscale IP:19999 转发到本机 VMess/WebSocket 服务。
-        "action": "route",
-        "outbound": "direct",
-        "override_address": "127.0.0.1",
-        "override_port": 19999
-      },
-      {
-        // 拒绝其他未被内置服务处理的 Tailscale 流量。
-        // SSH 22 已由内置 SSH 提前处理；此规则须放在端口转发规则之后。
-        "inbound": ["tailscale-proxy"],
-        "action": "reject"
       }
     ],
     // VMess 解密后的客户端请求使用服务器网络访问目标。
