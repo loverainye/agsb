@@ -31,6 +31,7 @@ PID_FILE = "tailscaled.pid"
 LAUNCHER_PID_FILE = "tailscale-launcher.pid"
 READY_FILE = "tailscale-ready.json"
 SOCKET_FILE = "tailscaled.sock"
+BINARY_DIR = "bin"
 
 
 def _digest(path):
@@ -41,25 +42,29 @@ def _digest(path):
 def ensure_binaries(install_dir):
     """Install the pinned official archive, verifying before extracting files."""
     install_dir = Path(install_dir)
+    binary_dir = install_dir / BINARY_DIR
     machine = platform.machine().lower()
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
     if platform.system() != "Linux" or arch not in ARCHIVES:
         raise RuntimeError(f"Tailscale: unsupported platform {platform.system()}/{machine}")
-    manifest = install_dir / "tailscale-binaries.json"
+    manifest = binary_dir / "tailscale-binaries.json"
+    cached = False
     try:
         saved = json.loads(manifest.read_text())
-        if saved["version"] == VERSION and saved["arch"] == arch and all(
-            _digest(install_dir / name) == saved["sha256"][name] for name in ("tailscale", "tailscaled")
-        ):
-            for name in ("tailscale", "tailscaled"):
-                (install_dir / name).chmod(0o755)
-            return
-    except (OSError, KeyError, ValueError):
+        cached = saved["version"] == VERSION and saved["arch"] == arch and all(
+            _digest(binary_dir / name) == saved["sha256"][name] for name in ("tailscale", "tailscaled")
+        )
+    except (OSError, KeyError, TypeError, ValueError):
         pass
-    install_dir.mkdir(parents=True, exist_ok=True)
+    if cached:
+        for name in ("tailscale", "tailscaled"):
+            (binary_dir / name).chmod(0o755)
+        migrate_legacy_cli(install_dir)
+        return
+    binary_dir.mkdir(parents=True, exist_ok=True)
     filename = f"tailscale_{VERSION}_{arch}.tgz"
     print(f"Tailscale: downloading official {VERSION}/{arch} from pkgs.tailscale.com", flush=True)
-    with tempfile.TemporaryDirectory(prefix=".tailscale-download-", dir=install_dir) as temporary:
+    with tempfile.TemporaryDirectory(prefix=".tailscale-download-", dir=binary_dir) as temporary:
         temporary = Path(temporary)
         archive = temporary / filename
         with urllib.request.urlopen(f"https://pkgs.tailscale.com/stable/{filename}", timeout=60) as response, archive.open("wb") as stream:
@@ -80,14 +85,31 @@ def ensure_binaries(install_dir):
                 hashes[name] = _digest(target)
                 target.chmod(0o755)
         for name in hashes:
-            os.replace(temporary / name, install_dir / name)
+            os.replace(temporary / name, binary_dir / name)
         tailscale_state._write_private(manifest, json.dumps({"version": VERSION, "arch": arch, "sha256": hashes}).encode())
     print(f"Tailscale: official {VERSION} binaries verified and installed", flush=True)
+    migrate_legacy_cli(install_dir)
+
+
+def migrate_legacy_cli(install_dir):
+    """Free the identity directory path occupied by the old CLI installation."""
+    install_dir = Path(install_dir)
+    legacy = install_dir / "tailscale"
+    if legacy.is_symlink():
+        raise ValueError("Tailscale: state directory must not be a symlink")
+    if not legacy.exists() or legacy.is_dir():
+        return
+    current = install_dir / BINARY_DIR / "tailscale"
+    if not legacy.is_file() or _digest(legacy) != _digest(current):
+        raise ValueError("Tailscale: identity directory path is occupied by an unknown file; inspect it before retrying")
+    # Keep the recognized old executable, moving it out of the identity path.
+    os.replace(legacy, install_dir / BINARY_DIR / "tailscale-legacy")
+    print("Tailscale: moved legacy CLI out of the identity directory path", flush=True)
 
 
 def cli(install_dir, *arguments, input_value=None, timeout=20, check=True):
     install_dir = Path(install_dir)
-    command = [str(install_dir / "tailscale"), f"--socket={install_dir / SOCKET_FILE}", *arguments]
+    command = [str(install_dir / BINARY_DIR / "tailscale"), f"--socket={install_dir / SOCKET_FILE}", *arguments]
     result = subprocess.run(command, input=input_value, capture_output=True, text=True,
                             timeout=timeout, env=singbox_environment())
     if check and result.returncode:
@@ -131,6 +153,8 @@ def local_api(install_dir, method, payload=None):
 
 def prepare_state(install_dir, settings):
     directory = Path(install_dir) / "tailscale"
+    if directory.exists() and not directory.is_dir():
+        migrate_legacy_cli(install_dir)
     if directory.is_symlink():
         raise ValueError("Tailscale: state directory must not be a symlink")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -214,7 +238,7 @@ def run(install_dir):
         ready.unlink(missing_ok=True)
         directory = prepare_state(install_dir, settings)
         # A private socket prevents mixing with the client's system tailscaled.
-        arguments = [str(install_dir / "tailscaled"), "--tun=userspace-networking",
+        arguments = [str(install_dir / BINARY_DIR / "tailscaled"), "--tun=userspace-networking",
                      f"--socket={install_dir / SOCKET_FILE}", f"--statedir={directory}",
                      f"--state={'mem:' if settings['ephemeral'] else directory / 'tailscaled.state'}",
                      "--encrypt-state=false", "--port=0", "--no-logs-no-support"]

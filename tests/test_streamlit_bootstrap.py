@@ -31,12 +31,18 @@ class BootstrapTests(unittest.TestCase):
         snapshot = patch.object(tailscale_state, "SNAPSHOT_PATH", Path(self.snapshot_directory.name) / "missing.enc")
         snapshot.start()
         self.addCleanup(snapshot.stop)
+        upterm = patch("upterm_manager.UptermManager")
+        self.upterm = upterm.start().return_value
+        self.upterm.prepare.return_value = True
+        self.upterm.start.return_value = True
+        self.addCleanup(upterm.stop)
 
     def test_main_starts_installer_and_reports_early_failure(self):
         launcher = load_script("launcher_main", "upload-yuancheng.py")
         identifier = "123e4567-e89b-12d3-a456-426614174000"
         for status, expected in ((None, True), (0, True), (1, False)):
             with self.subTest(status=status), patch.object(launcher, "launch_installer") as installer:
+                self.upterm.reset_mock()
                 installer.return_value.poll.return_value = status
                 self.assertEqual(launcher.main([
                     "--uuid", identifier, "--port", "19999", "--agk", "token", "--domain", "example.test"
@@ -44,14 +50,38 @@ class BootstrapTests(unittest.TestCase):
                 installer.assert_called_once_with({
                     "uuid": identifier, "port": 19999, "agk": "token", "domain": "example.test",
                 })
+                self.upterm.start.assert_called_once()
 
-    def test_no_install_skips_background_services(self):
+    def test_no_install_skips_installer_and_keeps_upterm(self):
         launcher = load_script("launcher_no_install", "upload-yuancheng.py")
         with patch.object(launcher, "launch_installer") as installer:
             self.assertTrue(launcher.main([
                 "--no-install", "--uuid", "123e4567-e89b-12d3-a456-426614174000",
             ]))
             installer.assert_not_called()
+            self.upterm.start.assert_called_once()
+
+    def test_installer_exception_does_not_prevent_upterm(self):
+        launcher = load_script("launcher_installer_failure", "upload-yuancheng.py")
+        with patch.object(launcher, "launch_installer", side_effect=RuntimeError("Tailscale identity unavailable")):
+            self.assertFalse(launcher.main([
+                "--uuid", "123e4567-e89b-12d3-a456-426614174000",
+                "--agk", "token", "--domain", "example.test",
+            ]))
+        self.upterm.prepare.assert_called_once()
+        self.upterm.start.assert_called_once()
+        self.upterm.cleanup.assert_called_once()
+
+    def test_upterm_failure_does_not_prevent_installer(self):
+        launcher = load_script("launcher_upterm_failure", "upload-yuancheng.py")
+        self.upterm.prepare.return_value = False
+        with patch.object(launcher, "launch_installer", return_value=None) as installer:
+            self.assertFalse(launcher.main([
+                "--uuid", "123e4567-e89b-12d3-a456-426614174000",
+                "--agk", "token", "--domain", "example.test",
+            ]))
+        installer.assert_called_once()
+        self.upterm.start.assert_not_called()
 
     def test_settings_use_port_environment(self):
         launcher = load_script("launcher", "upload-yuancheng.py")

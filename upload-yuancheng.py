@@ -9,7 +9,8 @@ import json
 import re
 import uuid as uuid_module
 from pathlib import Path
-from tailscale_support import cloudflare_settings, settings_from_env, start_log_relay
+from tailscale_support import cloudflare_settings, redact, settings_from_env, start_log_relay
+from upterm_manager import UptermManager
 
 # 配置
 USER_HOME = Path.home()
@@ -45,7 +46,7 @@ def _default_uuid():
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="启动 ArgoSB、Cloudflare Tunnel 和 Tailscale SSH/出口节点")
+    parser = argparse.ArgumentParser(description="启动 Upterm、ArgoSB、Cloudflare Tunnel 和 Tailscale")
     parser.add_argument("--uuid", default=None, help="sing-box 节点 UUID")
     parser.add_argument("--port", type=int, default=None, help="sing-box 本地端口")
     parser.add_argument("--agk", default=None, help="Cloudflare tunnel token")
@@ -200,27 +201,38 @@ def main(argv=None):
         print(f"配置错误: {exc}", flush=True)
         return False
 
-    if not args.no_install and (not settings["agk"] or not settings["domain"]):
-        print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN", flush=True)
-        return False
-
-    if args.no_install:
-        print("已跳过 ArgoSB 自动启动", flush=True)
-        return True
-
+    installer_ok = True
+    installer_process = None
     try:
-        print("=== ArgoSB 服务启动 ===", flush=True)
-        installer_process = launch_installer(settings)
-        if installer_process is not None:
-            status = installer_process.poll()
-            if status not in (None, 0):
-                print(f"ArgoSB 安装进程退出码: {status}", flush=True)
-                return False
-        print("ArgoSB 服务状态和 Tailscale SSH 连接信息请查看应用日志。", flush=True)
-        return True
-    except Exception as e:
-        print(f"✗ 程序执行出错: {e}", flush=True)
-        return False
+        if args.no_install:
+            print("已跳过 ArgoSB 自动启动；继续启动 Upterm", flush=True)
+        elif not settings["agk"] or not settings["domain"]:
+            print("配置错误: 自动启动命名隧道需要 AGK 和 DOMAIN；继续启动 Upterm", flush=True)
+            installer_ok = False
+        else:
+            print("=== ArgoSB 服务启动 ===", flush=True)
+            installer_process = launch_installer(settings)
+    except Exception as exc:
+        print(f"ArgoSB 启动失败: {redact(exc)}；继续启动 Upterm", flush=True)
+        installer_ok = False
+
+    manager = UptermManager(home=USER_HOME)
+    upterm_ok = False
+    try:
+        print("=== Upterm SSH 会话管理器 ===", flush=True)
+        upterm_ok = manager.prepare() and manager.start()
+    except Exception as exc:
+        print(f"Upterm 启动失败: {redact(exc)}", flush=True)
+    finally:
+        manager.cleanup()
+
+    if installer_process is not None:
+        status = installer_process.poll()
+        if status not in (None, 0):
+            print(f"ArgoSB 安装进程退出码: {status}", flush=True)
+            installer_ok = False
+    print("Upterm 连接命令及 ArgoSB/Tailscale 状态请查看应用日志。", flush=True)
+    return installer_ok and upterm_ok
 
 if __name__ == "__main__":
     success = main()

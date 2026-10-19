@@ -74,7 +74,7 @@ def settings_from_env(uuid_value, environ=None):
         "hostname": hostname.lower(),
         "ephemeral": ephemeral in ("true", "1"),
         "auth_key_hash": hashlib.sha256(key.encode()).hexdigest(),
-        "implementation": "official-tailscaled-userspace-v1",
+        "implementation": "official-tailscaled-userspace-bin-v2",
         "advertise_connector": True,
         "advertise_exit_node": True,
         "advertise_tags": tags,

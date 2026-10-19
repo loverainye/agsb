@@ -442,6 +442,10 @@ cd ~ && curl -fsSL https://raw.githubusercontent.com/zhumengkang/agsb/main/agsb-
 
 `upload-yuancheng.py` 是 Streamlit 入口。打开应用页面后，脚本在后台启动 `agsb-v2.py`；私有应用需先登录。只有 Uvicorn 日志时，先确认页面已加载。SSH 使用官方 Tailscale 二进制程序，启用方式和身份恢复配置见下文；应用日志会输出 `Tailscale SSH connection: ssh ...`。连接命令不写入 TXT 文件，也不上传到第三方文件服务。
 
+Upterm 也会自动启动，作为独立的备用 SSH 通道。使用仓库内的 v0.33.0 Linux amd64/arm64 二进制，校验后复制到 `~/upterm`，不从网络下载；应用日志直接输出 `Upterm SSH connection: ssh ...`。已有会话在重跑时复用，页面执行结束后保持后台运行。`--no-install` 仅跳过 ArgoSB，仍启动 Upterm；ArgoSB/Tailscale 启动失败时也继续尝试 Upterm。
+
+沿用此前允许持有连接命令的人加入 shell 的配置。需要限制连接者时，可设置 `UPTERM_AUTHORIZED_USER`、`UPTERM_AUTHORIZED_KEY` 或 `UPTERM_AUTHORIZED_KEYS`。Upterm 与 Tailscale 的连接命令分别显示在应用日志中。
+
 通过环境变量或 Streamlit Secrets 配置：
 
 ```bash
@@ -470,17 +474,19 @@ export TAILSCALE_EPHEMERAL="false"         # 复用节点身份；全新注册�
 export TAILSCALE_ADVERTISE_TAGS="tag:app-connector"  # 可选，须先配置 tagOwners
 ```
 
-设置 `TAILSCALE_AUTH_KEY` 或下文的 `TAILSCALE_STATE_KEY` 后，安装脚本从 `pkgs.tailscale.com` 下载固定版本 **1.104.1** 的官方 `tailscale` / `tailscaled`，校验归档 SHA-256 后安装到 `~/.agsb/`，支持 Linux amd64、arm64；已安装且校验通过时复用。Tailscale 不再使用 sing-box endpoint，也不要求 sing-box 包含 `with_tailscale`。
+设置 `TAILSCALE_AUTH_KEY` 或下文的 `TAILSCALE_STATE_KEY` 后，安装脚本从 `pkgs.tailscale.com` 下载固定版本 **1.104.1** 的官方 `tailscale` / `tailscaled`，校验归档 SHA-256 后安装到 `~/.agsb/bin/`，支持 Linux amd64、arm64；已安装且校验通过时复用。Tailscale 不再使用 sing-box endpoint，也不要求 sing-box 包含 `with_tailscale`。
+
+二进制与 `~/.agsb/tailscale/` 身份目录使用不同路径。旧版误把 CLI 安装到 `~/.agsb/tailscale` 时，升级会验证它与新 CLI 的哈希一致，再移动至 `~/.agsb/bin/tailscale-legacy`，让出身份目录路径。已有身份目录及加密快照继续复用；同名未知文件会保留并报错提示检查。
 
 `tailscaled` 独立运行在 `--tun=userspace-networking` 模式，使用私有 Unix socket 和原来的 `~/.agsb/tailscale/` 身份目录，无需 root、TUN 或 systemd。启动器启用以下偏好：
 
 ```bash
 # 由启动器设置；不要另起一个使用相同身份的 tailscaled。
-"$HOME/.agsb/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set \
+"$HOME/.agsb/bin/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set \
   --advertise-connector --ssh --accept-dns=false --accept-routes=false \
   --hostname=streamlit-agsb
 # 未宣告出口路由时再设置一次；以后保留 App Connector 已学习的路由。
-"$HOME/.agsb/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set --advertise-exit-node
+"$HOME/.agsb/bin/tailscale" --socket="$HOME/.agsb/tailscaled.sock" set --advertise-exit-node
 ```
 
 可通过节点 Tailscale IPv4/IPv6 的 TCP `$PORT` 访问 `127.0.0.1:$PORT` 的 VMess/WebSocket 入站。官方用户态网络自动完成本机 TCP 转发，`sb.json` 不再包含 Tailscale 转发规则。VMess 继续监听回环地址，`PORT=22` 会与 Tailscale SSH 冲突。普通用户运行的 Tailscale SSH 登录为该进程用户，Streamlit 中通常为 `appuser`。

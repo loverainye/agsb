@@ -36,14 +36,37 @@ class DaemonTests(unittest.TestCase):
                 with patch.object(daemon.urllib.request, "urlopen", return_value=io.BytesIO(blob)) as download:
                     daemon.ensure_binaries(root)
                     self.assertTrue(download.call_args.args[0].startswith("https://pkgs.tailscale.com/stable/"))
+                binary_dir = root / daemon.BINARY_DIR
+                self.assertEqual((binary_dir / "tailscale").read_bytes(), b"tailscale-test-binary")
+                # Reproduce the deployed failure: the previous installer put
+                # its executable at the exact path needed for node state.
+                (root / "tailscale").write_bytes(b"tailscale-test-binary")
                 with patch.object(daemon.urllib.request, "urlopen", side_effect=AssertionError("cache should be reused")):
                     daemon.ensure_binaries(root)
-                self.assertEqual((root / "tailscaled").stat().st_mode & 0o777, 0o755)
-                (root / "tailscaled").write_bytes(b"damaged")
+                    node_dir = daemon.prepare_state(root, SETTINGS)
+                    identity = node_dir / "tailscaled.state"
+                    identity.write_text("existing-node-identity")
+                    daemon.ensure_binaries(root)
+                    self.assertEqual(identity.read_text(), "existing-node-identity")
+                self.assertTrue(node_dir.is_dir())
+                self.assertEqual((binary_dir / "tailscale-legacy").read_bytes(), b"tailscale-test-binary")
+                self.assertEqual((binary_dir / "tailscaled").stat().st_mode & 0o777, 0o755)
+                (binary_dir / "tailscaled").write_bytes(b"damaged")
                 with patch.object(daemon.urllib.request, "urlopen", return_value=io.BytesIO(b"bad archive")):
                     with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
                         daemon.ensure_binaries(root)
-                self.assertEqual((root / "tailscale").read_bytes(), b"tailscale-test-binary")
+                self.assertEqual((binary_dir / "tailscale").read_bytes(), b"tailscale-test-binary")
+
+    def test_unknown_file_at_state_path_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / daemon.BINARY_DIR).mkdir()
+            (root / daemon.BINARY_DIR / "tailscale").write_bytes(b"verified-binary")
+            legacy = root / "tailscale"
+            legacy.write_text("unrelated-user-data")
+            with self.assertRaisesRegex(ValueError, "unknown file"):
+                daemon.prepare_state(root, SETTINGS)
+            self.assertEqual(legacy.read_text(), "unrelated-user-data")
 
     def test_cli_key_only_on_stdin_and_failures_redacted(self):
         env = {"TAILSCALE_AUTH_KEY": KEY, "TAILSCALE_STATE_KEY": "test-encryption-key", "AGK": "test-tunnel-token", "SUDO_UID": "12345"}
@@ -52,6 +75,7 @@ class DaemonTests(unittest.TestCase):
                 daemon.cli(Path("/tmp/test-install"), "up", "--auth-key=file:/dev/stdin", input_value=KEY)
             self.assertNotIn(KEY, str(error.exception))
             self.assertNotIn(KEY, str(run.call_args.args))
+            self.assertEqual(run.call_args.args[0][0], "/tmp/test-install/bin/tailscale")
             self.assertEqual(run.call_args.kwargs["input"], KEY)
             for name in env:
                 self.assertNotIn(name, run.call_args.kwargs["env"])
@@ -100,6 +124,7 @@ class DaemonTests(unittest.TestCase):
 
             def spawned(arguments, **kwargs):
                 restore.assert_called_once()
+                self.assertEqual(arguments[0], str(root / "bin" / "tailscaled"))
                 self.assertIn("--tun=userspace-networking", arguments)
                 self.assertIn(f"--state={prepared}/tailscaled.state", arguments)
                 self.assertNotIn("TAILSCALE_AUTH_KEY", kwargs["env"])

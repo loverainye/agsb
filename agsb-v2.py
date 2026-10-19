@@ -1054,6 +1054,7 @@ def stop_managed_service(pid_file, binary, script=None):
 
 def stop_tailscale_services():
     stop_managed_service(INSTALL_DIR / "tailscale-launcher.pid", Path(sys.executable), INSTALL_DIR / "tailscale_daemon.py")
+    stop_managed_service(INSTALL_DIR / "tailscaled.pid", INSTALL_DIR / "bin" / "tailscaled")
     stop_managed_service(INSTALL_DIR / "tailscaled.pid", INSTALL_DIR / "tailscaled")
     for name in ("tailscale-launcher.pid", "tailscaled.pid", "tailscale-ready.json"):
         (INSTALL_DIR / name).unlink(missing_ok=True)
