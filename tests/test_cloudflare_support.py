@@ -49,6 +49,13 @@ def installation():
 
 
 class CloudflareTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.snapshot_directory.cleanup)
+        snapshot = patch.object(support.tailscale_state, "SNAPSHOT_PATH", Path(self.snapshot_directory.name) / "missing.enc")
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+
     def test_template_injects_token_only_at_runtime_and_composes_with_tailscale(self):
         with installation() as (installer, state):
             settings = support.cloudflare_settings(TOKEN)

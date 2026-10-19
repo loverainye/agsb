@@ -28,6 +28,13 @@ def load_script(name, filename):
 
 
 class TailscaleTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.snapshot_directory.cleanup)
+        snapshot = patch.object(tailscale.tailscale_state, "SNAPSHOT_PATH", Path(self.snapshot_directory.name) / "missing.enc")
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+
     def test_opt_in_settings_validate_and_detect_key_changes(self):
         self.assertIsNone(tailscale.settings_from_env(UUID, {}))
         settings = tailscale.settings_from_env(UUID, {"TAILSCALE_AUTH_KEY": KEY})
@@ -69,6 +76,16 @@ class TailscaleTests(unittest.TestCase):
             self.assertNotIn("auth_key", config["endpoints"][0])
             with self.assertRaises(ValueError):
                 tailscale.runtime_config(config, {})
+
+    def test_existing_endpoint_keeps_runtime_auth_during_tag_upgrade(self):
+        config = {
+            "endpoints": [{"type": "tailscale", "tag": "tailscale-ssh"}],
+            "route": {"rules": [{"inbound": ["tailscale-ssh"], "action": "reject"}]},
+        }
+        runtime = json.loads(tailscale.runtime_config(config, {"TAILSCALE_AUTH_KEY": KEY}))
+        self.assertEqual(runtime["endpoints"][0]["auth_key"], KEY)
+        self.assertEqual(runtime["route"], config["route"])
+        self.assertNotIn("auth_key", config["endpoints"][0])
 
     def test_preflight_uses_stdin_and_redacts_validation_errors(self):
         config = {"endpoints": [{"tag": tailscale.TAILSCALE_TAG}]}
@@ -216,10 +233,11 @@ class TailscaleTests(unittest.TestCase):
                     (state / "config.json").write_text(json.dumps(config))
                     self.assertFalse(launcher._installer_already_started(settings))
                     config["tailscale"] = tailscale.settings_from_env(UUID)
-                    config["tailscale"].pop("proxy_forwarding")
-                    (state / "config.json").write_text(json.dumps(config))
-                    self.assertFalse(launcher._installer_already_started(settings))
-                    config["tailscale"]["proxy_forwarding"] = True
+                    for field in ("proxy_forwarding", "endpoint_tag"):
+                        value = config["tailscale"].pop(field)
+                        (state / "config.json").write_text(json.dumps(config))
+                        self.assertFalse(launcher._installer_already_started(settings))
+                        config["tailscale"][field] = value
                     (state / "config.json").write_text(json.dumps(config))
                     self.assertTrue(launcher._installer_already_started(settings))
                     with patch.dict(os.environ, {"TAILSCALE_HOSTNAME": "other-host"}):
@@ -256,7 +274,7 @@ class TailscaleTests(unittest.TestCase):
             with patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": KEY}, clear=True), contextlib.redirect_stdout(captured):
                 with installer_log.open("a") as stream:
                     stream.write("Tailscale: configuring\n")
-                sb_log.write_text("DEBUG endpoint/tailscale[tailscale-ssh]: auth " + KEY)
+                sb_log.write_text(f"DEBUG endpoint/tailscale[{tailscale.TAILSCALE_TAG}]: auth " + KEY)
                 relay.poll()
                 self.assertNotIn("auth", captured.getvalue())
                 with sb_log.open("a") as stream:

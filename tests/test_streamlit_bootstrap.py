@@ -9,6 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import tailscale_state
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,13 @@ def load_script(name, path):
 
 
 class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.snapshot_directory.cleanup)
+        snapshot = patch.object(tailscale_state, "SNAPSHOT_PATH", Path(self.snapshot_directory.name) / "missing.enc")
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+
     def test_installer_starts_when_upterm_is_unavailable(self):
         launcher = load_script("launcher_install_first", "upload-yuancheng.py")
         identifier = "123e4567-e89b-12d3-a456-426614174000"

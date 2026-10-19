@@ -444,7 +444,7 @@ def install(args):
 
     # sing-box
     singbox_path = INSTALL_DIR / "sing-box"
-    fallback_version = "1.14.3" if embedded_cloudflare or os.environ.get("TAILSCALE_AUTH_KEY", "").strip() else "1.9.0-beta.11"
+    fallback_version = "1.14.3" if embedded_cloudflare or os.environ.get("TAILSCALE_AUTH_KEY", "").strip() or os.environ.get("TAILSCALE_STATE_KEY", "").strip() else "1.9.0-beta.11"
     if not singbox_path.exists():
         try:
             print("获取sing-box最新版本号...")
@@ -514,7 +514,7 @@ def install(args):
         os.environ["AGK"] = argo_token.strip()
         print(f"Cloudflare: enabling Tunnel in the existing sing-box; origin=http://localhost:{public_port}", flush=True)
     tailscale = None
-    if os.environ.get("TAILSCALE_AUTH_KEY", "").strip():
+    if os.environ.get("TAILSCALE_AUTH_KEY", "").strip() or os.environ.get("TAILSCALE_STATE_KEY", "").strip():
         from tailscale_support import settings_from_env
         tailscale = settings_from_env(uuid_str)
         print(f"Tailscale: enabling SSH in the existing sing-box; hostname={tailscale['hostname']}, ephemeral={tailscale['ephemeral']}", flush=True)
@@ -940,6 +940,18 @@ def create_startup_script():
         source_path = Path(tailscale_support.__file__).resolve()
         if source_path != helper_path.resolve():
             shutil.copyfile(source_path, helper_path)
+        import tailscale_state
+        state_helper = INSTALL_DIR / "tailscale_state.py"
+        state_source = Path(tailscale_state.__file__).resolve()
+        if state_source != state_helper.resolve():
+            shutil.copyfile(state_source, state_helper)
+        snapshot_target = INSTALL_DIR / "tailscale-state.enc"
+        if (config.get("tailscale") or {}).get("state_snapshot"):
+            if tailscale_state.SNAPSHOT_PATH.resolve() != snapshot_target.resolve():
+                shutil.copyfile(tailscale_state.SNAPSHOT_PATH, snapshot_target)
+            snapshot_target.chmod(0o600)
+        else:
+            snapshot_target.unlink(missing_ok=True)
         sb_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(helper_path.resolve()))} {install_dir}"
 
     sb_start_script_path = INSTALL_DIR / "start_sb.sh"

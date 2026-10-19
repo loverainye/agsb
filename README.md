@@ -479,9 +479,36 @@ export TAILSCALE_EPHEMERAL="true"          # 可选，默认 true
 
 本地运行 daed 或其他代理客户端的机器先接入同一个 tailnet，并在 Tailscale ACL/grants 中允许到节点的 TCP `$PORT`。节点配置使用：服务器为控制台显示的 Tailscale IP（或可解析的 MagicDNS 名称），端口为 `$PORT`，协议为 VMess，UUID 不变，WebSocket 路径为 `/UUID前8位-vm`，关闭 TLS，传输由 Tailscale 加密。确保到 Tailscale IP 的底层连接走 Tailscale 网络。Cloudflare 隧道同时保留，原来的域名节点继续使用各自的 TLS/端口配置。应用日志会输出 `Tailscale VMess:` 参数和端口转发信息。
 
-Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-box 的标准输入传入；不会写进 `sb.json`、启动脚本或命令行。节点身份保存在 `~/.agsb/tailscale/`，应用重跑或保留此目录的重启会复用身份。完整重建容器后仍可能注册新节点，因此建议生成 **Reusable + Ephemeral** 的 Auth Key；离线临时节点由 Tailscale 自动清理，固定 hostname 本身不能防止重复注册。移除 Auth Key 后，下次应用执行会重新生成不含该 endpoint 的配置。
+Auth Key 只在启动时从环境变量读入，通过匿名文件作为 sing-box 的标准输入传入；不会写进 `sb.json`、启动脚本或命令行。节点身份保存在 `~/.agsb/tailscale/`。Streamlit Community Cloud 实测 Reboot 后，包含 `/mount/src` 在内的候选目录均未保留测试文件，因此本地路径不能保证跨重建保留身份。
 
-Streamlit 应用日志会显示 `Tailscale:` 启动信息、`endpoint/tailscale[tailscale-ssh]` 注册诊断，以及 `Tailscale SSH connection: ssh appuser@streamlit-agsb`。用户名从当前运行用户获取；此命令输出时节点可能仍在注册，先在 Tailscale 控制台确认节点在线。详细原始日志位于 `~/.agsb/sb.log`。日志持续转发由一个后台线程完成，不增加服务进程。
+#### 从仓库中的加密快照恢复节点
+
+仓库中的 `tailscale-state.enc` 是 AES-256-GCM 加密身份快照，包含 `tailscaled.state` 和 SSH 主机密钥，不包含日志、缓存或 Taildrop 文件。加密密钥单独放到 Streamlit Secrets 顶层字段：
+
+```toml
+TAILSCALE_STATE_KEY = "单独保存的32字节base64url加密密钥"
+TAILSCALE_HOSTNAME = "streamlit-agsb"
+TAILSCALE_EPHEMERAL = "false"
+```
+
+启动前验证并解密快照，恢复到 `~/.agsb/tailscale/`；目录权限为 `0700`，身份文件为 `0600`。本地已有同一身份时保留较新的本地状态。密钥缺失、密文被篡改或本地身份冲突时停止启动，不自动回退注册新节点。密钥不写入配置、启动脚本或命令行，并从 sing-box 环境中移除；`requirements.txt` 提供 `cryptography` 加密依赖。
+
+恢复模式默认使用快照中的 hostname，并关闭临时节点；可只配置 `TAILSCALE_STATE_KEY` 来恢复已有节点，不必用 Auth Key 注册。若仍保留 `TAILSCALE_AUTH_KEY`，它必须对应非临时节点。**现有节点如果在 Tailscale 控制台中仍为 Ephemeral，仅将配置改成 `false` 不能保证它不被服务端自动清理**；需要先完成非临时节点注册，再导出最终身份快照。不要同时运行使用同一份身份快照的多个实例。
+
+快照是一次导出，不会自动把运行期间更新的身份推回 Git。节点重新认证或密钥轮换后，需用同一密钥重新导出密文并更新仓库：
+
+```bash
+# TAILSCALE_STATE_KEY 从安全环境注入。
+python3 tailscale_state.py export --state-dir "$HOME/.agsb/tailscale" \
+  --hostname streamlit-agsb --output tailscale-state.enc
+# 新建快照时可用 python3 tailscale_state.py keygen 生成独立密钥。
+```
+
+仅把生成的 `.enc` 文件放入仓库。Tailscale 后台删除或过期的节点、过时快照均不能保证恢复原 IP；加密快照不会绕过控制台认证状态。未启用加密快照的部署仍可使用 Auth Key 注册临时节点，移除所有 Tailscale 密钥后，下次执行会生成不含该 endpoint 的配置。
+
+完整配置及逐项注释见 [Tailscale 代理配置示例](examples/sb.tailscale-proxy.example.jsonc)。入口标签统一为 `tailscale-proxy`，其作用是标识整个 Tailscale 入口；`ssh_server: true` 单独控制 SSH。示例同时保留内置 Cloudflare 隧道，演示端口为 `19999`。示例中的 UUID 和密钥占位符需替换；项目启动器会从环境变量注入密钥，sing-box 本身不会展开环境变量。旧入口标签的配置会在应用下次执行时重新生成。
+
+Streamlit 应用日志会显示 `Tailscale:` 启动信息、`endpoint/tailscale[tailscale-proxy]` 注册诊断，以及 `Tailscale SSH connection: ssh appuser@streamlit-agsb`。用户名从当前运行用户获取；此命令输出时节点可能仍在注册，先在 Tailscale 控制台确认节点在线。详细原始日志位于 `~/.agsb/sb.log`。日志持续转发由一个后台线程完成，不增加服务进程。
 
 启动前由应用用户创建 `~/.agsb/tailscale/` 和其中的 `taildrop/`，权限均为 `0700`，并显式指定 `taildrop_directory`。同时清除 sing-box 子进程继承的 `SUDO_USER`、`SUDO_UID`、`SUDO_GID` 等变量，让目录和 SSH 主机密钥归属当前应用用户，避免 Streamlit 容器因 `chown: operation not permitted` 退出。
 

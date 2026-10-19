@@ -12,12 +12,19 @@ import tempfile
 import threading
 from pathlib import Path
 
+import tailscale_state
 
-TAILSCALE_TAG = "tailscale-ssh"
+
+TAILSCALE_TAG = "tailscale-proxy"
 CLOUDFLARE_TAG = "cloudflare-tunnel"
 _RELAYS = {}
 _RELAY_LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _is_tailscale_endpoint(endpoint):
+    # Existing on-disk templates can still carry the previous endpoint tag.
+    return endpoint.get("type") == "tailscale" or endpoint.get("tag") in (TAILSCALE_TAG, "tailscale-ssh")
 
 
 def cloudflare_settings(token):
@@ -51,22 +58,35 @@ def add_cloudflare(config):
 def settings_from_env(uuid_value, environ=None):
     env = os.environ if environ is None else environ
     key = env.get("TAILSCALE_AUTH_KEY", "").strip()
-    if not key:
+    state_key = env.get(tailscale_state.KEY_ENV, "").strip()
+    if not key and not state_key:
         return None
-    hostname = env.get("TAILSCALE_HOSTNAME", "").strip() or f"agsb-{uuid_value[:8]}"
+    snapshot = None
+    snapshot_hash = None
+    if state_key or tailscale_state.SNAPSHOT_PATH.exists():
+        snapshot, snapshot_hash = tailscale_state.load_snapshot(env)
+    default_hostname = snapshot["hostname"] if snapshot else f"agsb-{uuid_value[:8]}"
+    hostname = env.get("TAILSCALE_HOSTNAME", "").strip() or default_hostname
     if not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", hostname):
         raise ValueError("TAILSCALE_HOSTNAME must be a hostname of 1-63 letters, numbers or hyphens")
-    ephemeral = env.get("TAILSCALE_EPHEMERAL", "true").strip().lower()
+    ephemeral = env.get("TAILSCALE_EPHEMERAL", "false" if snapshot else "true").strip().lower()
     if ephemeral not in ("true", "false", "1", "0"):
         raise ValueError("TAILSCALE_EPHEMERAL must be true or false")
+    if snapshot and ephemeral in ("true", "1"):
+        raise ValueError("Tailscale: encrypted identity restore requires TAILSCALE_EPHEMERAL=false")
     # Detect key changes without persisting the key itself.
-    return {
+    settings = {
         "hostname": hostname.lower(),
         "ephemeral": ephemeral in ("true", "1"),
         "auth_key_hash": hashlib.sha256(key.encode()).hexdigest(),
         # Reconfigure existing SSH-only installations on the next app run.
         "proxy_forwarding": True,
+        # Regenerate cached templates when the endpoint tag changes.
+        "endpoint_tag": TAILSCALE_TAG,
     }
+    if snapshot_hash:
+        settings["state_snapshot"] = snapshot_hash
+    return settings
 
 
 def prepare_endpoint_directories(endpoint, install_dir):
@@ -137,11 +157,16 @@ def runtime_config(config, environ=None):
                 raise ValueError("AGK is required to start the configured Cloudflare Tunnel")
             inbound["token"] = token
     for endpoint in result.get("endpoints", []):
-        if endpoint.get("tag") == TAILSCALE_TAG:
+        if _is_tailscale_endpoint(endpoint):
             key = env.get("TAILSCALE_AUTH_KEY", "").strip()
-            if not key:
+            if key:
+                endpoint["auth_key"] = key
+            elif env.get(tailscale_state.KEY_ENV, "").strip():
+                # A restored identity can authenticate without a bootstrap key.
+                tailscale_state.load_snapshot(env)
+                endpoint.pop("auth_key", None)
+            else:
                 raise ValueError("TAILSCALE_AUTH_KEY is required to start the configured Tailscale endpoint")
-            endpoint["auth_key"] = key
     return json.dumps(result)
 
 
@@ -151,7 +176,7 @@ def redact(message, secrets=()):
         secret = secret.strip()
         if secret:
             message = message.replace(secret, "[redacted]")
-    for name in ("TAILSCALE_AUTH_KEY", "AGK", "agk"):
+    for name in ("TAILSCALE_AUTH_KEY", tailscale_state.KEY_ENV, "AGK", "agk"):
         secret = os.environ.get(name, "").strip()
         if secret:
             message = message.replace(secret, "[redacted]")
@@ -162,7 +187,7 @@ def singbox_environment():
     environment = os.environ.copy()
     # sing-box's CLI uses SUDO_* to select a file owner. Streamlit can inherit
     # these from its bootstrap while running as a different, unprivileged user.
-    for name in ("AGK", "agk", "TAILSCALE_AUTH_KEY", "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND"):
+    for name in ("AGK", "agk", "TAILSCALE_AUTH_KEY", tailscale_state.KEY_ENV, "SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND"):
         environment.pop(name, None)
     return environment
 
@@ -171,7 +196,7 @@ def validate_config(binary, config):
     features = []
     if any(item.get("tag") == CLOUDFLARE_TAG for item in config.get("inbounds", [])):
         features.append(("Cloudflare", "with_cloudflared"))
-    if any(item.get("tag") == TAILSCALE_TAG for item in config.get("endpoints", [])):
+    if any(_is_tailscale_endpoint(item) for item in config.get("endpoints", [])):
         features.append(("Tailscale", "with_tailscale"))
     child_env = singbox_environment()
     version = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15, env=child_env)
@@ -197,15 +222,21 @@ def run_singbox(install_dir):
     install_dir = Path(install_dir).resolve()
     config = json.loads((install_dir / "sb.json").read_text())
     for endpoint in config.get("endpoints", []):
-        if endpoint.get("tag") == TAILSCALE_TAG:
+        if _is_tailscale_endpoint(endpoint):
             prepare_endpoint_directories(endpoint, install_dir)
+            if os.environ.get(tailscale_state.KEY_ENV, "").strip() or tailscale_state.SNAPSHOT_PATH.exists():
+                if endpoint.get("ephemeral", False):
+                    raise ValueError("Tailscale: encrypted identity restore requires ephemeral=false")
+                restored = tailscale_state.restore_state(endpoint["state_directory"])
+                status = "restored from encrypted snapshot" if restored else "reusing newer local state for the saved identity"
+                print(f"Tailscale: {status}; state directory={endpoint['state_directory']}", flush=True)
             print("Tailscale: state and Taildrop directories prepared by the app user (0700)", flush=True)
     payload = runtime_config(config).encode()
     if any(item.get("tag") == CLOUDFLARE_TAG for item in config.get("inbounds", [])):
         print("Cloudflare: starting Tunnel in the existing sing-box process; token injected from AGK", flush=True)
         print("Cloudflare: connection and ingress diagnostics are in sb.log; startup does not yet confirm edge registration", flush=True)
     for endpoint in config.get("endpoints", []):
-        if endpoint.get("tag") == TAILSCALE_TAG:
+        if _is_tailscale_endpoint(endpoint):
             username = pwd.getpwuid(os.getuid()).pw_name
             command = f"ssh {shlex.quote(username + '@' + endpoint['hostname'])}"
             print(f"Tailscale: starting SSH in the existing sing-box process; user={username}", flush=True)
